@@ -23,7 +23,7 @@ export async function prepareDeployment(spec, destination) {
   // Exclusive directory creation prevents accidental secret rotation or overwrites.
   await mkdir(destination, { mode: 0o700 });
   await mkdir(path.join(destination, 'config'), { mode: 0o700 });
-  for (const relative of ['package.json', 'package-lock.json', 'LICENSE', 'relay/src/node-server.mjs',
+  for (const relative of ['package.json', 'package-lock.json', 'LICENSE', 'LICENSES/Microdex-MIT.txt', 'THIRD_PARTY_NOTICES.md', 'relay/src/node-server.mjs',
     'relay/src/index.js', 'relay/src/turn-credentials.mjs', 'bridge/lib/remote-relay.mjs', 'mobile/lib/ice-config.mjs']) {
     const target = path.join(destination, 'app', relative);
     await mkdir(path.dirname(target), { recursive: true }); await copyFile(path.join(root, relative), target);

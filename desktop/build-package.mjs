@@ -65,7 +65,7 @@ const companion = path.join(application, 'bridge/native', name + '操作助手')
 run('xcrun', ['swiftc', '-O', '-target', `${process.arch === 'arm64' ? 'arm64' : 'x86_64'}-apple-macos13.0`,
   '-framework', 'AppKit', '-framework', 'ApplicationServices', '-framework', 'Carbon',
   'bridge/native/MicrodexDesktop.swift', '-o', companion]);
-for (const [source, target] of [['LICENSE', 'Microdex-LICENSE.txt'], ['vendor/BlackHole/LICENSE', 'GPL-3.0.txt'],
+for (const [source, target] of [['LICENSE', 'NoKey-GPL-3.0.txt'], ['LICENSES/Microdex-MIT.txt', 'Microdex-LICENSE.txt'], ['THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_NOTICES.md'], ['vendor/BlackHole/LICENSE', 'GPL-3.0.txt'],
   ['node_modules/electron/dist/LICENSE', 'Electron-LICENSE.txt'],
   ['node_modules/electron/dist/LICENSES.chromium.html', 'Chromium-LICENSES.html']])
   await copy(path.join(root, source), path.join(resources, 'Licenses', target));
