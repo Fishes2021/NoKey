@@ -1,0 +1,14 @@
+#!/bin/sh
+# Validate both identities before migrating the original install path.
+set -eu
+/bin/sh "$(/usr/bin/dirname "$0")/validate" "$@"
+base=${3%/}
+legacy="$base/Applications/语音快捷键盘.app"
+current="$base/Applications/NoKey.app"
+if [ -e "$legacy" ]; then
+  if [ -e "$current" ]; then
+    printf '%s\n' 'NoKey：发现新旧两份客户端，请先整理，未覆盖。' >&2
+    exit 1
+  fi
+  /bin/mv "$legacy" "$current"
+fi

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Read-only preflight. macOS Installer supplies the target volume as argument 3.
+set -eu
+fail() { printf '%s\n' "语音快捷键盘：$*" >&2; exit 1; }
+volume=${3:?缺少安装目标卷}
+case "$volume" in /*) ;; *) fail '安装目标必须为绝对路径。';; esac
+[ -d "$volume" ] && [ ! -L "$volume" ] || fail '安装目标卷不可用或是符号链接。'
+base=${volume%/}
+for relative in Applications Library Library/Audio Library/Audio/Plug-Ins Library/Audio/Plug-Ins/HAL; do
+  directory="$base/$relative"
+  [ ! -L "$directory" ] || fail "目标目录是符号链接，请先检查：$relative"
+  if [ -e "$directory" ] && [ ! -d "$directory" ]; then fail "目标目录被同名文件占用：$relative"; fi
+done
+check_bundle() {
+  bundle="$base/$1"
+  [ ! -L "$bundle" ] || fail "目标组件是符号链接：$1"
+  if [ ! -e "$bundle" ]; then return; fi
+  [ -d "$bundle" ] || fail "目标组件被同名文件占用：$1"
+  [ ! -L "$bundle/Contents" ] && [ ! -L "$bundle/Contents/Info.plist" ] || fail "目标组件信息是符号链接：$1"
+  actual=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Contents/Info.plist" 2>/dev/null) || fail "无法识别已有组件，未覆盖：$1"
+  [ "$actual" = "$2" ] || fail "同名位置已有其他软件，未覆盖：$1"
+}
+check_bundle 'Applications/NoKey.app' 'org.voicedeck.desktop'
+check_bundle 'Applications/语音快捷键盘.app' 'org.voicedeck.desktop'
+check_bundle 'Library/Audio/Plug-Ins/HAL/VoiceDeckMicrophone.driver' 'org.voicedeck.microphone'
+# Inspect executable paths only, not command arguments or process-name substrings.
+process_list=$(LC_ALL=en_US.UTF-8 /bin/ps -axww -o comm=) || fail '无法检查运行中的客户端，请稍后重试。'
+printf '%s\n' "$process_list" | while IFS= read -r executable; do
+  case "$executable" in
+    */语音快捷键盘.app/Contents/MacOS/语音快捷键盘|*/NoKey.app/Contents/MacOS/语音快捷键盘) fail '请先退出语音快捷键盘客户端，再重新安装。';;
+  esac
+done
+exit 0

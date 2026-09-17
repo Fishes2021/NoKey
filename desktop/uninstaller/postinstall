@@ -1,0 +1,16 @@
+#!/bin/sh
+# Runs only after the user authorizes the macOS uninstall package.
+set -eu
+# Reuse the installer checks, immediately before removing either component.
+/bin/sh "$(/usr/bin/dirname "$0")/preinstall" "$@"
+volume=${3:?缺少卸载目标卷}
+base=${volume%/}
+/bin/rm -rf "$base/Applications/语音快捷键盘.app" "$base/Applications/NoKey.app" "$base/Library/Audio/Plug-Ins/HAL/VoiceDeckMicrophone.driver"
+# Scope receipt operations to the same target volume, including in tests.
+if /usr/sbin/pkgutil --volume "$volume" --pkg-info org.voicedeck.desktop.installer >/dev/null 2>&1; then
+  /usr/sbin/pkgutil --volume "$volume" --forget org.voicedeck.desktop.installer || {
+    printf '%s\n' '语音快捷键盘：组件已移除，但安装记录清理失败。' >&2
+    exit 1
+  }
+fi
+printf '%s\n' '语音快捷键盘客户端和虚拟麦克风已移除；个人配对配置已保留。请重启 Mac。'

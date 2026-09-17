@@ -1,0 +1,51 @@
+{
+  "name": "nokey",
+  "version": "0.1.15",
+  "description": "iPhone microphone and universal shortcut panel for Mac",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "app": "node bridge/scripts/start-mobile-dev.mjs",
+    "bridge": "node bridge/server.mjs",
+    "pair": "node bridge/scripts/microdex.mjs pair",
+    "mobile": "npm --prefix mobile start",
+    "mobile:lan": "npm --prefix mobile start -- --lan",
+    "web": "npm --prefix web run dev",
+    "web:build": "npm --prefix web run build",
+    "lint": "npm --prefix mobile run lint",
+    "test": "node --test bridge/test/*.test.mjs",
+    "native:test": "node bridge/native-shim/self-test.mjs",
+    "fast:on": "node bridge/scripts/set-fast.mjs on",
+    "fast:off": "node bridge/scripts/set-fast.mjs off",
+    "fast:status": "node bridge/scripts/set-fast.mjs status",
+    "desktop:keyboard": "node desktop/build-keyboard.mjs",
+    "desktop:driver": "node desktop/build-driver.mjs",
+    "desktop:output": "node desktop/build-output.mjs",
+    "desktop:rtc:test": "node desktop/run-rtc-check.mjs",
+    "desktop:start": "electron desktop/launch.mjs",
+    "desktop:mobile:test": "node desktop/run-rtc-check.mjs ./check-mobile.cjs",
+    "desktop:client:test": "node desktop/run-rtc-check.mjs ./check-client.cjs",
+    "relay:start": "node relay/src/node-server.mjs",
+    "relay:test": "node --test relay/test/*.test.mjs",
+    "desktop:turn:build": "node desktop/build-turn-test.mjs",
+    "desktop:turn:test": "node desktop/run-turn-check.mjs",
+    "desktop:package": "node desktop/build-package.mjs",
+    "desktop:package:test": "node desktop/check-package.mjs",
+    "desktop:install:test": "node desktop/check-install-preflight.mjs",
+    "desktop:uninstall:test": "node desktop/check-uninstall.mjs",
+    "mobile:ios:prepare": "node mobile/scripts/prepare-ios.mjs",
+    "mobile:ios:build": "node mobile/scripts/build-ios.mjs"
+  },
+  "engines": {
+    "node": ">=20.19"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.2.0",
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.21.1"
+  },
+  "devDependencies": {
+    "electron": "44.4.1"
+  },
+  "license": "GPL-3.0-only"
+}

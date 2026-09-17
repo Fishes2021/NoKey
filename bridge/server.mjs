@@ -1,0 +1,1160 @@
+import { confirmPairingWithDeadline } from './lib/pairing-confirmation.mjs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import qrcode from 'qrcode-terminal';
+
+import {
+  REASONING_EFFORTS,
+  applyFastMode,
+  applyReasoningEffort,
+  readCodexStatus,
+} from './lib/codex-config.mjs';
+import {
+  desktopControlStatus,
+  ensureDesktopCompanion,
+  executeCodexDesktopAction,
+} from './lib/codex-desktop-control.mjs';
+import {
+  closeDesktopQueueMenu,
+  launchDesktopQueueMenu,
+} from './lib/desktop-queue-menu.mjs';
+import { executeDesktopAction } from './lib/desktop-shortcuts.mjs';
+import { CodexAppServer } from './lib/codex-app-server.mjs';
+import {
+  buildActionAvailability,
+  CODEX_KEYCAP_IDS,
+  CODEX_PROGRAMMABLE_ACTIONS,
+  executeProgrammedAction,
+  normalizeProgrammedAction,
+} from './lib/programmed-actions.mjs';
+import { attachRemoteEvents } from './lib/remote-events.mjs';
+import { RemoteMessageQueue } from './lib/remote-message-queue.mjs';
+import {
+  PairingSession,
+  REVIEW_PAIRING_TTL_MS,
+} from './lib/pairing-session.mjs';
+import {
+  E2EEAuthenticationError,
+  E2EEClientRegistry,
+} from './lib/e2ee-client-registry.mjs';
+import { openE2EE, sealE2EE } from './lib/e2ee.mjs';
+import { createRemoteRelay, safeLocalApiPath } from './lib/remote-relay.mjs';
+import { createKeyboardController } from './lib/keyboard-api.mjs';
+import { handleVoiceRequest } from './lib/voice-api.mjs';
+import { createControlSession } from './lib/control-session.mjs';
+import { createRemoteTunnel } from './lib/remote-tunnel.mjs';
+import {
+  applyFastSetting,
+  applyReasoningSetting,
+} from './lib/remote-settings.mjs';
+import {
+  BRIDGE_NAME,
+  BRIDGE_PROTOCOL_VERSION,
+  BRIDGE_VERSION,
+} from './lib/package-info.mjs';
+import { NativeShimClient } from './lib/native-shim-client.mjs';
+import { mergeVisibleDesktopState } from './lib/visible-desktop-state.mjs';
+import {
+  printCheck,
+  printQr,
+  printStep,
+  printWarning,
+  ui,
+} from './lib/terminal-ui.mjs';
+
+export async function startBridge(options = {}) {
+const embedded = options.embedded === true;
+if (embedded && typeof options.confirmPairing !== 'function') throw new Error('嵌入客户端必须提供本机配对确认');
+if (embedded && options.remoteAccess && !options.relayOrigin) throw new Error('请配置国内中继地址');
+let codexEnabled = options.codexEnabled ?? !embedded;
+const bridgeDir = path.dirname(fileURLToPath(import.meta.url));
+let port = options.port ?? Number(process.env.MICRODEX_PORT || 3210);
+const host = options.host ?? process.env.MICRODEX_HOST ?? '0.0.0.0';
+const accessToken = options.accessToken || process.env.MICRODEX_TOKEN || randomBytes(32).toString('base64url');
+const localToken = embedded ? randomBytes(32).toString('base64url') : accessToken;
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+const microdexHome = options.stateDir || process.env.MICRODEX_HOME || path.join(os.homedir(), '.microdex');
+const configPath = process.env.MICRODEX_CONFIG_PATH || path.join(codexHome, 'config.toml');
+const hooksDir = process.env.MICRODEX_HOOKS_DIR || path.join(bridgeDir, 'hooks');
+const backgroundMode = process.env.MICRODEX_BACKGROUND === '1';
+const remoteAccessEnabled = options.remoteAccess ?? (embedded ? false : process.env.MICRODEX_REMOTE_ACCESS !== '0');
+const quickTunnelEnabled =
+  !embedded && remoteAccessEnabled && process.env.MICRODEX_QUICK_TUNNEL === '1';
+let pairingSession = new PairingSession({ accessToken });
+let closing = false;
+let pairingMode = 'standard';
+const e2eeClients = new E2EEClientRegistry({ stateDir: microdexHome });
+const keyboardController = createKeyboardController(options.keyboard, { onPosted: options.onKeyboardPosted });
+const controlSession = createControlSession({ voiceOwner: options.voiceOwner });
+async function handleAuthenticatedRequest(context) {
+  if (closing) throw Object.assign(new Error('客户端已停止'), { statusCode: 503 });
+  e2eeClients.assertActive(context);
+  const invoke = async () => {
+    e2eeClients.assertActive(context);
+    const handled = keyboardController.handle(context) || await handleVoiceRequest(context);
+    if (handled) return handled;
+    e2eeClients.assertActive(context);
+    const requestedPath = safeLocalApiPath(context.payload.path);
+    if (!requestedPath || requestedPath.startsWith('/api/e2ee')) throw Object.assign(new Error('无效请求路径'), { statusCode: 400 });
+    const method = context.payload.method === 'POST' ? 'POST' : 'GET';
+    const response = await fetch(`http://127.0.0.1:${port}${requestedPath}`, {
+      method, headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'X-Microdex-Token': localToken, 'X-VoiceDeck-Device': context.material.keyId },
+      body: method === 'POST' ? JSON.stringify(context.payload.body ?? {}) : undefined,
+    });
+    return { status: response.status, contentType: response.headers.get('content-type'), body: await response.text() };
+  };
+  return context.payload.method === 'POST' ? controlSession.run(context.material.keyId, invoke) : invoke();
+}
+const stableRelay = createRemoteRelay({
+  port,
+  stateDir: microdexHome,
+  accessToken,
+  localToken,
+  authenticate: tokenMatches,
+  e2eeClients,
+  claimEncryptedPairing,
+  handleAuthenticatedRequest,
+  allowLegacy: !embedded && process.env.MICRODEX_ALLOW_LEGACY_REMOTE === '1',
+  enabled: remoteAccessEnabled,
+  ...(options.relayOrigin ? { relayOrigin: options.relayOrigin } : {}),
+});
+const quickTunnel = createRemoteTunnel({
+  port,
+  stateDir: microdexHome,
+  enabled: quickTunnelEnabled,
+});
+let stableRelayState = stableRelay.state();
+let quickTunnelState = quickTunnel.state();
+
+function effectiveRemoteAccess() {
+  if (stableRelayState.ready) return stableRelayState;
+  if (quickTunnelState.ready) return { ...quickTunnelState, transport: 'quick-tunnel' };
+  if (!remoteAccessEnabled) return stableRelayState;
+  return {
+    ...stableRelayState,
+    error: stableRelayState.error || quickTunnelState.error,
+  };
+}
+
+let remoteTunnelState = effectiveRemoteAccess();
+const codex = new CodexAppServer({ lazy: true });
+let remoteEvents = null;
+const unavailableDesktop = { available: false, trusted: false, running: false };
+let desktopReady = (codexEnabled ? ensureDesktopCompanion() : Promise.resolve(unavailableDesktop)).catch((error) => ({
+  available: false,
+  trusted: false,
+  running: false,
+  error: error?.message || 'Desktop companion is unavailable.',
+}));
+const messageQueue = new RemoteMessageQueue({
+  getState: () => codex.state(),
+  send: async ({ threadId, text }, signal, owner, controlTicket) => {
+    if (owner) await e2eeClients.materialFor(owner);
+    const send = async () => {
+      signal.throwIfAborted();
+      await codex.selectThread(threadId);
+      await new Promise((resolve) => setTimeout(resolve, 320));
+      signal.throwIfAborted();
+      await executeCodexDesktopAction('send-text', text);
+    };
+    const outcome = owner ? await controlSession.run(owner, send, { existing: controlTicket || true }) : await send();
+    if (outcome?.status === 409) throw Object.assign(new Error(JSON.parse(outcome.body).error), { statusCode: 409 });
+  },
+  onChange: () => remoteEvents?.notify(),
+});
+const nativeShim = new NativeShimClient();
+if (codexEnabled) nativeShim.start();
+nativeShim.subscribe(() => remoteEvents?.notify());
+const unsubscribeMessageQueue = codex.subscribe(() => {
+  void messageQueue.handleCodexChange();
+});
+
+function sendJson(response, status, payload) {
+  response.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Microdex-Token',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  });
+  response.end(JSON.stringify(payload));
+}
+
+function tokenMatches(provided = '', token = accessToken) {
+  const expected = Buffer.from(token);
+  const actual = Buffer.from(String(provided));
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+async function claimEncryptedPairing(envelope) {
+  const invitation = pairingSession;
+  const material = invitation.encryption;
+  if (envelope?.keyId !== material.keyId) throw new E2EEAuthenticationError();
+  let payload;
+  try {
+    payload = openE2EE(material, 'pair', envelope);
+  } catch {
+    throw new E2EEAuthenticationError();
+  }
+  const requestId = String(payload.requestId ?? '').trim();
+  const issuedAt = Number(payload.issuedAt);
+  if (
+    !/^[A-Za-z0-9_-]{16,64}$/.test(requestId) ||
+    !Number.isFinite(issuedAt) ||
+    Math.abs(Date.now() - issuedAt) > 5 * 60 * 1000
+  ) {
+    throw new E2EEAuthenticationError();
+  }
+  const result = invitation.claim(String(payload.code ?? ''));
+  let responsePayload;
+  if (!result.ok) {
+    responsePayload = {
+      error: result.reason === 'expired'
+        ? '配对二维码已过期，请在 Mac 客户端点击刷新二维码。'
+        : result.reason === 'claimed'
+          ? '此配对二维码已使用，请在 Mac 客户端生成新二维码。'
+          : '配对信息无效，请重新扫描 Mac 客户端中的二维码。',
+      code: result.reason === 'expired' ? 'PAIRING_EXPIRED' : 'PAIRING_REJECTED',
+    };
+  } else if ((!await confirmPairingWithDeadline(options.confirmPairing, material.keyId)) ||
+      closing || invitation !== pairingSession || invitation.expiresAt <= Date.now()) {
+    responsePayload = { error: 'Mac 未允许此次配对，请重新扫码', code: 'PAIRING_REJECTED' };
+    if (!closing && invitation === pairingSession) {
+      pairingSession = new PairingSession({ accessToken });
+      options.onPairingChanged?.(pairingDetails());
+    }
+  } else {
+    await e2eeClients.addClient(material);
+    options.onDevicesChanged?.();
+    if (!embedded) printCheck('iPhone paired', 'End-to-end encrypted session saved');
+    responsePayload = { token: result.token, protocolVersion: BRIDGE_PROTOCOL_VERSION };
+  }
+  return {
+    envelope: sealE2EE(material, `pair-response:${requestId}`, responsePayload),
+  };
+}
+
+async function readBody(request) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of request) {
+    total += chunk.length;
+    if (total > 32_768) throw Object.assign(new Error('Request is too large.'), { statusCode: 413 });
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw Object.assign(new Error('Invalid JSON.'), { statusCode: 400 });
+  }
+}
+
+async function handleDirectEncryptedRequest(pathname, body) {
+  if (pathname === '/api/e2ee/pair') return claimEncryptedPairing(body.envelope);
+  if (pathname === '/api/e2ee/session') {
+    const session = await e2eeClients.createSession(body.envelope, tokenMatches);
+    return { envelope: session.envelope };
+  }
+  if (pathname !== '/api/e2ee') {
+    throw Object.assign(new Error('Unknown encrypted Microdex endpoint.'), { statusCode: 404 });
+  }
+
+  const context = await e2eeClients.openSessionMessage(body.envelope, 'request');
+  const requestedPath = safeLocalApiPath(context.payload.path);
+  if (!requestedPath || requestedPath.startsWith('/api/e2ee')) {
+    throw Object.assign(new Error('Invalid encrypted bridge request path.'), { statusCode: 400 });
+  }
+  return { envelope: e2eeClients.sealResponse(context, await handleAuthenticatedRequest(context)) };
+}
+
+async function publicStatus() {
+  const current = codexEnabled ? await readCodexStatus(configPath) : { fastMode: false, reasoningEffort: 'medium' };
+  const desktop = await readDesktopStatus();
+  let remote = null;
+  try {
+    remote = await remoteState();
+  } catch (error) {
+    remote = { online: false, error: error?.message || 'Codex App Server is unavailable.' };
+  }
+  return {
+    connected: true,
+    device: { name: os.hostname() },
+    bridge: {
+      name: BRIDGE_NAME,
+      version: BRIDGE_VERSION,
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    },
+    capabilities: {
+      verifiedSettings: true,
+      remoteChat: true,
+      taskControl: true,
+      programmableActions: CODEX_PROGRAMMABLE_ACTIONS.length,
+      programmableAssignments: true,
+      encoderModes: true,
+      desktopAutomation: Boolean(
+        desktop?.available && desktop?.trusted && desktop?.running,
+      ),
+      actionAvailability: true,
+      visibleDesktopRouting: true,
+      nativeHardware: nativeShim.state().connected,
+      endToEndEncryption: true,
+    },
+    connection: {
+      remoteAccess: remoteTunnelState.status,
+      remoteReady: remoteTunnelState.ready,
+      transport: remoteTunnelState.ready
+        ? remoteTunnelState.transport === 'relay' ? 'relay' : 'https'
+        : 'local',
+    },
+    fastMode: current.fastMode,
+    reasoningEffort: current.reasoningEffort,
+    configPath,
+    platform: process.platform,
+    desktop,
+    remote,
+  };
+}
+
+function readDesktopStatus() {
+  return codexEnabled ? desktopControlStatus().catch(() => desktopReady) : Promise.resolve(unavailableDesktop);
+}
+async function remoteState() {
+  if (!codexEnabled) return { online: false, selectedThreadId: null, selected: null,
+    threads: [], pendingApproval: null, messageQueue: [], error: '尚未启用 Codex 快捷控制' };
+  const [appServerState, desktop] = await Promise.all([
+    codex.state(),
+    readDesktopStatus(),
+  ]);
+  const state = mergeVisibleDesktopState(appServerState, desktop);
+  return {
+    ...state,
+    voice: {
+      state: desktop?.voiceActive ? 'active' : 'inactive',
+      muted: Boolean(desktop?.voiceMuted),
+    },
+    messageQueue: messageQueue.list(),
+    actionAvailability: buildActionAvailability({
+      state,
+      desktop,
+      native: nativeShim.state(),
+    }),
+    hardware: {
+      mode: nativeShim.state().connected ? 'native' : 'standard',
+      ...nativeShim.state(),
+    },
+  };
+}
+
+// `applied` and `verified` mean the bridge ran the command without error. That
+// is now trustworthy on its own: the companion throws when a control cannot be
+// found, so a failing action returns an HTTP error instead of a fake success.
+//
+// `confirmed` is the stricter claim, and only `codex` evidence earns it: the
+// App Server reported the new state back. A key stroke has no return value, so
+// a desktop action is delivered but unconfirmed. Both fields are kept because
+// older app builds read `verified` and would show an error without it.
+function withVerifiedCommand(state, action, evidence = 'codex') {
+  const confirmed = evidence === 'codex';
+  return {
+    ...state,
+    commandResult: {
+      action,
+      applied: true,
+      verified: true,
+      confirmed,
+      evidence,
+      desktopMirrored: evidence === 'desktop',
+      warning: confirmed
+        ? null
+        : 'Sent to the Codex window. The bridge cannot read back the result.',
+    },
+  };
+}
+
+function actionNotApplied(message) {
+  const error = new Error(message);
+  error.statusCode = 409;
+  error.code = 'ACTION_NOT_APPLIED';
+  return error;
+}
+
+async function applyNativeFastSetting(enabled) {
+  const before = await codex.state();
+  if (before.selected?.fastMode === enabled) return before;
+
+  // Preserve the native Codex Micro event for parity with the real hardware,
+  // then use the idempotent visible control as the authoritative operation.
+  // If the HID action already worked, the desktop helper observes the target
+  // value and does nothing; if it did not, the helper applies it.
+  await nativeShim.command({ type: 'action.tap', action: 'fast' });
+  return (await applyFastSetting({
+    body: {
+      threadId: before.selectedThreadId,
+      fastMode: enabled,
+    },
+    codex,
+  })).state;
+}
+
+async function applyNativeReasoningSetting(effort) {
+  const before = await codex.state();
+  const selected = before.selected;
+  if (!selected) throw new Error('Select a Codex task first.');
+  if (selected.reasoningEffort === effort) return before;
+  const efforts = selected.supportedReasoningEfforts?.length
+    ? selected.supportedReasoningEfforts
+    : REASONING_EFFORTS;
+  if (!efforts.includes(effort)) {
+    const error = new Error(`${effort} reasoning is not supported by the active Codex model.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  const currentIndex = Math.max(0, efforts.indexOf(selected.reasoningEffort));
+  const targetIndex = efforts.indexOf(effort);
+  return (await applyReasoningSetting({
+    body: {
+      threadId: before.selectedThreadId,
+      reasoningEffort: effort,
+      reasoningDirection:
+        targetIndex < currentIndex ? 'reasoning-down' : 'reasoning-up',
+    },
+    codex,
+  })).state;
+}
+
+/** Enough for a fast flick, low enough that a bad client cannot spin forever. */
+const MAX_ENCODER_STEPS = 24;
+
+async function runEncoderAction({ mode, delta, press = false, steps = 1 }) {
+  if (!['composer-navigation', 'conversation-scroll'].includes(mode)) {
+    const error = new Error('Invalid encoder mode.');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!press && ![-1, 1].includes(delta)) {
+    const error = new Error('Encoder delta must be -1 or 1.');
+    error.statusCode = 400;
+    throw error;
+  }
+  // Detents arrive batched: one round trip for a whole flick rather than one per
+  // notch, each of which used to wait for the previous request to finish.
+  const repeat = press
+    ? 1
+    : Math.min(MAX_ENCODER_STEPS, Math.max(1, Math.trunc(steps) || 1));
+
+  if (mode === 'composer-navigation') {
+    const action = press
+      ? 'composer-select'
+      : delta > 0
+        ? 'composer-next'
+        : 'composer-previous';
+    for (let step = 0; step < repeat; step += 1) {
+      await executeCodexDesktopAction(action);
+    }
+    return;
+  }
+  if (!press) {
+    const action = delta > 0 ? 'conversation-scroll-down' : 'conversation-scroll-up';
+    for (let step = 0; step < repeat; step += 1) {
+      await executeCodexDesktopAction(action);
+    }
+  }
+}
+
+function queueState() {
+  return { messageQueue: messageQueue.list() };
+}
+
+function bridgeAddresses() {
+  const isPrivateAddress = (address) => {
+    const octets = address.split('.').map(Number);
+    return (
+      octets[0] === 10 ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && octets[1] === 168)
+    );
+  };
+  const isCarrierGradeNat = (address) => {
+    const octets = address.split('.').map(Number);
+    return octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;
+  };
+  const isTunnelInterface = (name) =>
+    /^(?:utun|tun|tap|ppp|ipsec|wg|tailscale)/i.test(name);
+
+  const addresses = Object.entries(os.networkInterfaces())
+    .flatMap(([name, entries]) =>
+      (entries ?? [])
+        .filter((entry) => entry?.family === 'IPv4' && !entry.internal)
+        .map((entry, index) => {
+          let priority = 0;
+          if (/^en\d+$/i.test(name)) priority += 200;
+          if (isPrivateAddress(entry.address)) priority += 100;
+          if (isCarrierGradeNat(entry.address)) priority -= 50;
+          if (isTunnelInterface(name)) priority -= 200;
+          if (entry.address.startsWith('169.254.')) priority -= 300;
+          return {
+            address: entry.address,
+            order: index,
+            priority,
+          };
+        }),
+    )
+    .sort((left, right) => right.priority - left.priority || left.order - right.order)
+    .map((entry) => `http://${entry.address}:${port}`);
+  return addresses.length ? addresses : [`http://127.0.0.1:${port}`];
+}
+
+function pairingDetails() {
+  const localAddresses = bridgeAddresses();
+  const remoteAddress = remoteTunnelState.ready ? remoteTunnelState.url : null;
+  const addresses = remoteAddress
+    ? [remoteAddress, ...localAddresses.filter((address) => address !== remoteAddress)]
+    : localAddresses;
+  const urls = addresses.map((address) => {
+    const pairingUrl = new URL(`${address.replace(/\/$/, '')}/pair`);
+    pairingUrl.searchParams.set('code', pairingSession.code);
+    const encryption = pairingSession.encryption;
+    pairingUrl.hash = new URLSearchParams({
+      e2ee: '1',
+      deviceName: os.hostname(),
+      keyId: encryption.keyId,
+      key: encryption.key,
+    }).toString();
+    return pairingUrl.toString();
+  });
+  return {
+    pairingUrl: urls[0],
+    pairingUrls: urls,
+    expiresAt: pairingSession.expiresAt,
+    mode: pairingMode,
+    singleUse: true,
+    remoteAccess: {
+      status: remoteTunnelState.status,
+      ready: remoteTunnelState.ready,
+      url: remoteAddress,
+      transport: remoteTunnelState.transport,
+      error: remoteTunnelState.error,
+      retryAt: remoteTunnelState.retryAt ?? null,
+    },
+  };
+}
+
+const server = http.createServer(async (request, response) => {
+  try {
+    if (request.method === 'OPTIONS') return sendJson(response, 204, {});
+    const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+
+    if (request.method === 'GET' && url.pathname === '/health') {
+      return sendJson(response, 200, {
+        ok: true,
+        name: BRIDGE_NAME,
+        version: BRIDGE_VERSION,
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        endToEndEncryption: true,
+        remoteAccess: {
+          status: remoteTunnelState.status,
+          ready: remoteTunnelState.ready,
+          transport: remoteTunnelState.transport,
+        },
+      });
+    }
+
+    // Public pairing landing page. The QR contains a short-lived, one-time code,
+    // never the persistent bridge credential.
+    if (request.method === 'GET' && url.pathname === '/pair') {
+      const code = url.searchParams.get('code')?.trim() ?? '';
+      const validation = pairingSession.validate(code);
+      if (!validation.ok) {
+        const message = validation.reason === 'expired'
+          ? '配对二维码已过期，请在 Mac 客户端点击刷新二维码。'
+          : validation.reason === 'claimed'
+            ? '此配对二维码已使用，请在 Mac 客户端生成新二维码。'
+            : '配对信息无效，请重新扫描 Mac 客户端中的二维码。';
+        return sendJson(response, validation.reason === 'expired' ? 410 : 401, { error: message });
+      }
+      const forwardedProtocol = request.headers['x-forwarded-proto'];
+      const bridgeProtocol = (
+        Array.isArray(forwardedProtocol) ? forwardedProtocol[0] : forwardedProtocol
+      ) === 'https'
+        ? 'https'
+        : 'http';
+      const bridgeUrl = `${bridgeProtocol}://${request.headers.host || `127.0.0.1:${port}`}`;
+      // Three slashes on purpose. `microdex://pair` parses `pair` as the host and
+      // leaves the path empty, so Expo Router receives nothing to match and the
+      // app opens on "Unmatched Route". The empty-host form gives a real `/pair`.
+      const deepLink = new URL('voicedeck:///pair');
+      deepLink.searchParams.set('url', bridgeUrl);
+      deepLink.searchParams.set('code', code);
+      const escapedDeepLink = deepLink.toString()
+        .replaceAll('&', '&amp;')
+        .replaceAll('"', '&quot;');
+      const nonce = randomBytes(18).toString('base64url');
+      const html = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>语音快捷键盘配对</title>
+<style nonce="${nonce}">body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1418;color:#e8eef2;font-family:system-ui,sans-serif;padding:24px;text-align:center}
+a{display:inline-block;margin-top:18px;padding:14px 22px;border-radius:12px;background:#2f6fed;color:#fff;text-decoration:none;font-weight:600}
+p{opacity:.75;line-height:1.45;max-width:28rem}</style></head>
+<body><div>
+<h1>语音快捷键盘</h1>
+<p>点击下方按钮，在已安装的手机 App 中继续配对，然后在 Mac 上确认。若未能打开，请回到 App 扫描 Mac 客户端中的二维码。</p>
+<p>配对邀请限时有效，且只能使用一次。</p><p>尚未安装 App 时，请先向提供本开发版的维护者获取 iPhone 安装版本。</p>
+<a id="open-microdex" href="${escapedDeepLink}">打开语音快捷键盘</a>
+</div><script nonce="${nonce}">
+const link=document.getElementById('open-microdex');const fragment=new URLSearchParams(location.hash.slice(1));
+if(fragment.get('e2ee')==='1'&&fragment.get('keyId')&&fragment.get('key')){const target=new URL(link.href);target.searchParams.set('e2ee','1');target.searchParams.set('keyId',fragment.get('keyId'));target.searchParams.set('key',fragment.get('key'));if(fragment.get('deviceName'))target.searchParams.set('deviceName',fragment.get('deviceName'));link.href=target.toString();}
+</script></body></html>`;
+      response.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'Referrer-Policy': 'no-referrer',
+        'Content-Security-Policy': `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`,
+      });
+      return response.end(html);
+    }
+
+    if (
+      request.method === 'POST' &&
+      ['/api/e2ee/pair', '/api/e2ee/session', '/api/e2ee'].includes(url.pathname)
+    ) {
+      const body = await readBody(request);
+      return sendJson(response, 200, await handleDirectEncryptedRequest(url.pathname, body));
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/pair/claim') {
+      if (embedded) return sendJson(response, 426, { error: '请使用加密配对' });
+      const body = await readBody(request);
+      const result = pairingSession.claim(String(body.code || ''));
+      if (!result.ok) {
+        const message = result.reason === 'expired'
+          ? '配对二维码已过期，请在 Mac 客户端点击刷新二维码。'
+          : result.reason === 'claimed'
+            ? '此配对二维码已使用，请在 Mac 客户端生成新二维码。'
+            : '配对信息无效，请重新扫描 Mac 客户端中的二维码。';
+        return sendJson(response, result.reason === 'expired' ? 410 : 401, { error: message });
+      }
+      console.log('');
+      printCheck('iPhone paired', 'Secure session saved');
+      console.log(`  ${ui.dim('You can start controlling Codex now.')}\n`);
+      return sendJson(response, 200, { token: result.token });
+    }
+
+    if (!tokenMatches(request.headers['x-microdex-token'], localToken)) {
+      return sendJson(response, 401, { error: 'Invalid bridge access code.' });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/pair/new') {
+      const body = await readBody(request);
+      const mode = body.mode === 'review' ? 'review' : 'standard';
+      if (body.mode && !['standard', 'review'].includes(body.mode)) {
+        return sendJson(response, 400, { error: 'Invalid pairing mode.' });
+      }
+      pairingMode = mode;
+      pairingSession = new PairingSession({
+        accessToken,
+        ttlMs: mode === 'review' ? REVIEW_PAIRING_TTL_MS : undefined,
+      });
+      return sendJson(response, 200, pairingDetails());
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/status') {
+      return sendJson(response, 200, await publicStatus());
+    }
+
+    if (!codexEnabled && request.method === 'POST') {
+      return sendJson(response, 503, { error: '请先在 Mac 启用快捷控制' });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/actions/fast') {
+      const body = await readBody(request);
+      if (typeof body.enabled !== 'boolean') {
+        return sendJson(response, 400, { error: 'The enabled field must be a boolean.' });
+      }
+      if (nativeShim.state().connected) await applyNativeFastSetting(body.enabled);
+      else await applyFastMode(configPath, body.enabled);
+      return sendJson(response, 200, await publicStatus());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/actions/reasoning') {
+      const body = await readBody(request);
+      if (!REASONING_EFFORTS.includes(body.effort)) {
+        return sendJson(response, 400, { error: 'Invalid reasoning level.' });
+      }
+      if (nativeShim.state().connected) await applyNativeReasoningSetting(body.effort);
+      else await applyReasoningEffort(configPath, body.effort);
+      return sendJson(response, 200, await publicStatus());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/actions/shortcut') {
+      const body = await readBody(request);
+      if (typeof body.action !== 'string') {
+        return sendJson(response, 400, { error: 'Missing action.' });
+      }
+      const message = await executeDesktopAction(body.action, hooksDir);
+      return sendJson(response, 200, { ok: true, message });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/remote/state') {
+      return sendJson(response, 200, await remoteState());
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/remote/queue') {
+      return sendJson(response, 200, queueState());
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/programmable/actions') {
+      const state = await remoteState();
+      return sendJson(response, 200, {
+        keycaps: CODEX_KEYCAP_IDS.map((id) => ({ id })),
+        actions: CODEX_PROGRAMMABLE_ACTIONS.map(({ id, label, kind, availability }) => ({
+          id,
+          label,
+          kind,
+          availability,
+          runtime: state.actionAvailability[id],
+        })),
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/programmable/action') {
+      const body = await readBody(request);
+      if (
+        body.keycapId !== undefined &&
+        !CODEX_KEYCAP_IDS.includes(body.keycapId)
+      ) {
+        return sendJson(response, 400, { error: 'Invalid keycapId.' });
+      }
+      const normalized = normalizeProgrammedAction(body);
+      const nativeConnected = nativeShim.state().connected;
+      await executeProgrammedAction({
+        ...normalized,
+        threadId: body.threadId,
+        codex,
+        applyFast: nativeConnected
+          ? (settings) => applyNativeFastSetting(settings.fastMode)
+          : undefined,
+        applyReasoning: nativeConnected
+          ? (settings) => applyNativeReasoningSetting(settings.reasoningEffort)
+          : undefined,
+        // Use operations that can report a real result. Native HID delivery is
+        // transport acknowledgment only and must not be treated as completion.
+        approval: body.approval,
+        resolveApproval: (decision, approval) => codex.resolveApproval(decision, approval),
+        executeFork: (threadId) => codex.forkThread(threadId),
+        executeDesktop: executeCodexDesktopAction,
+      });
+      return sendJson(
+        response,
+        200,
+        withVerifiedCommand(
+          await remoteState(),
+          normalized.commandId,
+          ['fast', 'effort', 'approve', 'decline', 'fork'].includes(
+            CODEX_PROGRAMMABLE_ACTIONS.find(
+              (action) => action.id === normalized.commandId,
+            )?.kind,
+          )
+            ? 'codex'
+            : 'desktop',
+        ),
+      );
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/remote/select') {
+      const body = await readBody(request);
+      if (typeof body.threadId !== 'string' || !body.threadId) {
+        return sendJson(response, 400, { error: 'Missing threadId.' });
+      }
+      const state = await codex.state();
+      const target = state.threads.find((thread) => thread.id === body.threadId);
+      if (!target) return sendJson(response, 404, { error: 'Codex task not found.' });
+      await executeCodexDesktopAction('select-chat', target.name);
+      codex.markSelectedThread(body.threadId);
+      return sendJson(response, 200, await remoteState());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/remote/settings') {
+      const body = await readBody(request);
+      let commandResult = null;
+      if (body.fastMode === undefined && body.reasoningEffort === undefined) {
+        return sendJson(response, 400, { error: 'Missing setting.' });
+      }
+      if (body.fastMode !== undefined && typeof body.fastMode !== 'boolean') {
+        return sendJson(response, 400, { error: 'fastMode must be boolean.' });
+      }
+      if (body.reasoningEffort !== undefined && !REASONING_EFFORTS.includes(body.reasoningEffort)) {
+        return sendJson(response, 400, { error: 'Invalid reasoning level.' });
+      }
+      if (
+        body.reasoningDirection !== undefined &&
+        !['reasoning-up', 'reasoning-down'].includes(body.reasoningDirection)
+      ) {
+        return sendJson(response, 400, { error: 'Invalid reasoning direction.' });
+      }
+      if (body.fastMode !== undefined) {
+        if (nativeShim.state().connected) await applyNativeFastSetting(body.fastMode);
+        else await applyFastSetting({ body, codex });
+        commandResult = {
+          action: 'fast',
+          applied: true,
+          verified: true,
+          evidence: 'codex',
+          desktopMirrored: true,
+          warning: null,
+        };
+      }
+      if (body.reasoningEffort !== undefined) {
+        // The native HID path returns a state and cannot report clamping; the
+        // standard bridge path returns the full outcome.
+        const outcome = nativeShim.state().connected
+          ? null
+          : await applyReasoningSetting({ body, codex });
+        if (!outcome) await applyNativeReasoningSetting(body.reasoningEffort);
+        commandResult = {
+          action: 'reasoning',
+          applied: true,
+          verified: true,
+          evidence: 'codex',
+          desktopMirrored: true,
+          // The active model may not offer the requested level. Saying so keeps
+          // the dial honest instead of leaving it on a value Codex never took.
+          warning: outcome?.clamped
+            ? `${body.reasoningEffort} is not available for this model. Codex stayed on ${outcome.appliedEffort}.`
+            : null,
+        };
+      }
+      return sendJson(response, 200, {
+        ...await remoteState(),
+        commandResult,
+      });
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/remote/send') {
+      const body = await readBody(request);
+      const text = String(body.text || '').trim();
+      if (text) {
+        const owner = request.headers['x-voicedeck-device'];
+        if (embedded || owner) await e2eeClients.materialFor(owner);
+        messageQueue.enqueue({ threadId: body.threadId, text, owner, controlTicket: controlSession.ticket(owner) });
+        return sendJson(response, 200, queueState());
+      }
+      await executeCodexDesktopAction('send');
+      return sendJson(response, 200, await remoteState());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/remote/queue/remove') {
+      const body = await readBody(request);
+      if (typeof body.messageId !== 'string' || !body.messageId) {
+        return sendJson(response, 400, { error: 'Missing messageId.' });
+      }
+      if (!messageQueue.remove(body.messageId)) {
+        return sendJson(response, 409, { error: 'Message is no longer queued.' });
+      }
+      return sendJson(response, 200, queueState());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/remote/fork') {
+      const body = await readBody(request);
+      const before = await codex.state();
+      const sourceThreadId = body.threadId || before.selectedThreadId;
+      if (!sourceThreadId) throw actionNotApplied('Select a Codex task first.');
+      const forked = await codex.forkThread(sourceThreadId);
+      if (
+        !forked.selectedThreadId ||
+        forked.selectedThreadId === sourceThreadId
+      ) {
+        throw actionNotApplied('Codex did not create the new task.');
+      }
+      return sendJson(
+        response,
+        200,
+        withVerifiedCommand(await remoteState(), 'forkThread'),
+      );
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/remote/archive') {
+      const body = await readBody(request);
+      if (!body.threadId) throw actionNotApplied('Select a Codex task first.');
+      messageQueue.removeThread(body.threadId);
+      const archived = await codex.archiveThread(body.threadId);
+      if (archived.threads.some((thread) => thread.id === body.threadId)) {
+        throw actionNotApplied('Codex did not archive the task.');
+      }
+      return sendJson(
+        response,
+        200,
+        withVerifiedCommand(await remoteState(), 'archiveThread'),
+      );
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/remote/new') {
+      const before = await codex.state();
+      const created = await codex.openNewThread();
+      if (
+        !created.selectedThreadId ||
+        created.selectedThreadId === before.selectedThreadId
+      ) {
+        throw actionNotApplied('Codex did not create the new task.');
+      }
+      return sendJson(
+        response,
+        200,
+        withVerifiedCommand(await remoteState(), 'newThread'),
+      );
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/remote/approval') {
+      const body = await readBody(request);
+      if (!['approve', 'decline'].includes(body.decision)) {
+        return sendJson(response, 400, { error: 'Invalid approval decision.' });
+      }
+      await codex.resolveApproval(body.decision, body.approval);
+      const nextState = await remoteState();
+      if (nextState.pendingApproval?.requestId === body.approval.requestId &&
+          nextState.pendingApproval?.threadId === body.approval.threadId) {
+        throw actionNotApplied('Codex did not resolve the approval request.');
+      }
+      return sendJson(response, 200, withVerifiedCommand(
+        nextState, body.decision === 'approve' ? 'approval.approve' : 'approval.decline',
+      ));
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/desktop/status') {
+      return sendJson(response, 200, await readDesktopStatus());
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/desktop/action') {
+      const body = await readBody(request);
+      if (![
+        'plan',
+        'dictation',
+        'dictation-start',
+        'dictation-stop',
+        'voice-start',
+        'voice-toggle-mute',
+        'voice-end',
+        'send',
+        'sidebar',
+        'back',
+        'forward',
+      ].includes(body.action)) {
+        return sendJson(response, 400, { error: 'Invalid desktop action.' });
+      }
+      const desktopResult = await executeCodexDesktopAction(body.action);
+      const nextState = withVerifiedCommand(await remoteState(), body.action, 'desktop');
+      if (desktopResult.voiceState) {
+        nextState.voice = {
+          state: desktopResult.voiceState,
+          muted: Boolean(desktopResult.voiceMuted),
+        };
+      }
+      return sendJson(
+        response,
+        200,
+        nextState,
+      );
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/encoder/action') {
+      const body = await readBody(request);
+      if (!['step', 'press'].includes(body.action)) {
+        return sendJson(response, 400, { error: 'Invalid encoder action.' });
+      }
+      await runEncoderAction({
+        mode: body.mode,
+        delta: Number(body.delta),
+        press: body.action === 'press',
+        // Older app builds send no `steps`, which stays one notch per request.
+        steps: body.steps === undefined ? 1 : Number(body.steps),
+      });
+      return sendJson(
+        response,
+        200,
+        withVerifiedCommand(
+          await remoteState(),
+          `encoder.${body.mode}.${body.action}`,
+          'desktop',
+        ),
+      );
+    }
+
+    return sendJson(response, 404, { error: 'Endpoint not found.' });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode) || 500;
+    return sendJson(response, statusCode, {
+      error: error?.message || 'Internal bridge error.',
+      ...(error?.code ? { code: error.code } : {}),
+    });
+  }
+});
+
+remoteEvents = attachRemoteEvents({
+  server,
+  codex: {
+    state: remoteState,
+    subscribe: (listener) => codex.subscribe(listener),
+  },
+  authenticate: token => tokenMatches(token, localToken),
+  e2eeClients,
+});
+
+const listening = new Promise((resolve, reject) => {
+server.once('error', reject);
+server.listen(port, host, () => {
+  port = server.address().port;
+  resolve();
+  if (embedded) { stableRelay.start(); return; }
+  void launchDesktopQueueMenu({ port, token: accessToken }).catch((error) => {
+    console.error(`Microdex queue menu unavailable: ${error?.message || error}`);
+  });
+  const preferredAddress = bridgeAddresses()[0];
+
+  if (backgroundMode) {
+    console.log(`Microdex background bridge ready at ${preferredAddress}`);
+  } else {
+    console.log('');
+    printCheck('Codex runtime', 'Connected');
+    printCheck('Local bridge', `${preferredAddress}`);
+    console.log('');
+    if (remoteAccessEnabled) {
+      printStep(1, 'Preparing secure remote access', 'Works on Wi-Fi or mobile data');
+    }
+  }
+  stableRelay.start();
+  quickTunnel.start();
+  void desktopReady.then(async (desktop) => {
+    if (desktop.available && !desktop.trusted) {
+      await desktopControlStatus({ prompt: true });
+      printWarning(
+        'Accessibility permission needed',
+        'System Settings → Privacy & Security → Accessibility',
+      );
+    } else if (desktop.trusted) {
+      printCheck('Desktop controls', 'Ready');
+    } else if (desktop.error) {
+      printWarning('Desktop controls unavailable', desktop.error);
+    }
+  });
+});
+
+});
+
+let lastPrintedPairingUrl = null;
+let foregroundFallbackTimer = null;
+
+function printForegroundPairing(remoteReady) {
+  if (backgroundMode || embedded) return;
+  const { pairingUrl } = pairingDetails();
+  if (pairingUrl === lastPrintedPairingUrl) return;
+  lastPrintedPairingUrl = pairingUrl;
+  console.log('');
+  if (remoteReady) printCheck('Remote access', 'Ready on Wi-Fi or mobile data');
+  else printWarning('Remote access unavailable', 'This fallback QR requires the same Wi-Fi');
+  printStep(2, 'Open Microdex and tap Scan pairing QR');
+  printStep(3, 'Scan this one-time code');
+  printQr(pairingUrl, qrcode);
+  console.log(`  ${ui.dim(`Can't scan? ${pairingUrl}`)}`);
+  console.log(`  ${ui.dim('One-time QR · expires in 10 minutes · keep this window open')}`);
+  console.log(`  ${ui.dim('Press Control-C to stop Microdex.')}\n`);
+}
+
+function publishRemoteAccess() {
+  const previousUrl = remoteTunnelState.url;
+  remoteTunnelState = effectiveRemoteAccess();
+  options.onPairingChanged?.(pairingDetails());
+  if (remoteTunnelState.ready) {
+    if (foregroundFallbackTimer) clearTimeout(foregroundFallbackTimer);
+    foregroundFallbackTimer = null;
+    if (backgroundMode && previousUrl !== remoteTunnelState.url) {
+      const label = remoteTunnelState.transport === 'relay' ? 'stable relay' : 'beta tunnel';
+      console.log(`Microdex ${label} ready at ${remoteTunnelState.url}`);
+    } else if (!backgroundMode) {
+      printForegroundPairing(true);
+    }
+  } else if (
+    backgroundMode &&
+    ['offline', 'cooldown', 'error'].includes(remoteTunnelState.status) &&
+    remoteTunnelState.error
+  ) {
+    console.error(`Microdex remote access: ${remoteTunnelState.error}`);
+  }
+}
+
+const unsubscribeStableRelay = stableRelay.subscribe((state) => {
+  stableRelayState = state;
+  publishRemoteAccess();
+});
+const unsubscribeQuickTunnel = quickTunnel.subscribe((state) => {
+  quickTunnelState = state;
+  publishRemoteAccess();
+});
+
+if (!remoteAccessEnabled) {
+  printForegroundPairing(false);
+} else if (!backgroundMode && !embedded) {
+  foregroundFallbackTimer = setTimeout(() => printForegroundPairing(false), 45_000);
+}
+
+const unsubscribeRevoked = e2eeClients.subscribeRevoked(keyId => {
+  keyboardController.revoke(keyId);
+  controlSession.revoke(keyId);
+  messageQueue.revoke(keyId);
+  options.onDeviceRevoked?.(keyId);
+});
+let stopping;
+function shutdown() {
+  if (stopping) return stopping;
+  closing = true;
+  stopping = new Promise(resolve => {
+  if (!embedded) console.log(`  ${ui.dim('Stopping Microdex…')}`);
+  if (!embedded) closeDesktopQueueMenu();
+  if (foregroundFallbackTimer) clearTimeout(foregroundFallbackTimer);
+  unsubscribeRevoked();
+  unsubscribeStableRelay();
+  unsubscribeQuickTunnel();
+  stableRelay.close();
+  quickTunnel.close();
+  remoteEvents.close();
+  unsubscribeMessageQueue();
+  messageQueue.close();
+  nativeShim.stop();
+  codex.close();
+  server.close(resolve);
+  server.closeAllConnections();
+  });
+  return stopping;
+}
+
+try { await listening; } catch (error) { await shutdown(); throw error; }
+return {
+  setKeyboardEnabled: value => keyboardController.setEnabled(value),
+  port, pairing: pairingDetails, close: shutdown,
+  listDevices: () => e2eeClients.listClients(),
+  async revokeDevice(keyId) {
+    await e2eeClients.removeClient(keyId);
+    options.onDevicesChanged?.();
+  },
+  refreshPairing() {
+    pairingSession = new PairingSession({ accessToken });
+    const details = pairingDetails(); options.onPairingChanged?.(details); return details;
+  },
+  async enableShortcuts() {
+    codexEnabled = true;
+    nativeShim.start();
+    desktopReady = ensureDesktopCompanion();
+    await Promise.all([desktopReady, codex.ready()]);
+  },
+};
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const bridge = await startBridge();
+  const stop = () => void bridge.close();
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+}
