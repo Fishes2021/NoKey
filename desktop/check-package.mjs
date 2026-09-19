@@ -46,6 +46,22 @@ const preinstall = path.join(expanded, 'payload.pkg/Scripts/preinstall');
 assert.equal(await readFile(preinstall, 'utf8'), await readFile(path.join(root, 'desktop/installer/preinstall'), 'utf8'));
 run('/bin/sh', [preinstall, 'test.pkg', '/', payload]);
 for (const item of [bundle, ...(withDriver ? [driver] : [])]) run('codesign', ['--verify', '--deep', '--strict', item]);
+if (artifact.release) {
+  assert.match(run('pkgutil', ['--check-signature', artifact.pkg]), /Developer ID Installer:/);
+  for (const item of [bundle, ...(withDriver ? [driver] : [])]) {
+    run('codesign', ['--verify', '--deep', '--strict', '-R',
+      '=anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists', item]);
+    const details = spawnSync('codesign', ['-d', '--verbose=4', item], { encoding: 'utf8' });
+    assert.equal(details.status, 0, details.stderr);
+    assert.match(details.stderr, /flags=.*runtime/);
+    assert.match(details.stderr, /Timestamp=/);
+  }
+  const entitlements = spawnSync('codesign', ['-d', '--entitlements', ':-', bundle], { encoding: 'utf8' });
+  assert.equal(entitlements.status, 0, entitlements.stderr);
+  assert.match(entitlements.stdout, /com.apple.security.cs.allow-jit/);
+  assert(!entitlements.stdout.includes('com.apple.security.get-task-allow'));
+}
+
 const uninstall = path.join(check, 'uninstaller');
 run('pkgutil', ['--expand-full', path.join(bundle, 'Contents/Resources/VoiceDeck-Uninstall.pkg'), uninstall]);
 for (const [name, source] of [['preinstall', 'installer/validate'], ['postinstall', 'uninstaller/postinstall']]) {

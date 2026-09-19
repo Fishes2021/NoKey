@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Development packaging only. Never invokes installer, sudo or audio services.
-import { cp, mkdir, mkdtemp, readFile, writeFile, rename, readdir, rm } from 'node:fs/promises';
+// Build only. Never installs, notarizes, publishes or restarts audio services.
+import { cp, mkdir, mkdtemp, readFile, writeFile, rename, readdir, rm, open } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -8,7 +8,8 @@ import assert from 'node:assert/strict';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const args = process.argv.slice(2);
-assert(args.length === 0 || (args.length === 1 && args[0] === '--with-driver'), '仅支持 --with-driver（首次安装或驱动更新）');
+assert(args.every(arg => ['--with-driver', '--release'].includes(arg)) && new Set(args).size === args.length, '仅支持 --with-driver 和 --release');
+const release = args.includes('--release');
 const withDriver = args.includes('--with-driver');
 assert.equal(process.platform, 'darwin');
 const name = 'NoKey', version = '0.1.0', identifier = 'org.voicedeck.desktop';
@@ -17,9 +18,15 @@ function run(command, args) {
   if (result.error || result.status !== 0) throw result.error || new Error(`${command}: ${result.stderr || result.stdout}`);
   return result.stdout.trim();
 }
-const identities = [...run('security', ['find-identity', '-v', '-p', 'codesigning']).matchAll(/([A-F0-9]{40}) "Apple Development:[^"]+"/g)].map(match => match[1]);
+const identityList = run('security', ['find-identity', '-v']);
+const certificateType = release ? 'Developer ID Application' : 'Apple Development';
+const identities = [...identityList.matchAll(new RegExp(`([A-F0-9]{40}) "${certificateType}:[^"]+"`, 'g'))].map(match => match[1]);
 const signingIdentity = process.env.VOICEDECK_SIGN_IDENTITY || (identities.length === 1 ? identities[0] : null);
-assert(signingIdentity && signingIdentity !== '-', '需要稳定开发签名；设置 VOICEDECK_SIGN_IDENTITY 为开发证书，不能用临时签名破坏更新后的权限身份');
+assert(identities.includes(signingIdentity), `需要有效的 ${certificateType} 身份；多个身份时设置 VOICEDECK_SIGN_IDENTITY`);
+const installerIdentities = [...identityList.matchAll(/([A-F0-9]{40}) "Developer ID Installer:[^"]+"/g)].map(match => match[1]);
+const installerIdentity = process.env.VOICEDECK_INSTALLER_IDENTITY || (installerIdentities.length === 1 ? installerIdentities[0] : null);
+if (release) assert(installerIdentities.includes(installerIdentity), '需要有效的 Developer ID Installer 身份');
+const installerSigning = release ? ['--sign', installerIdentity, '--timestamp'] : [];
 for (const script of [...(withDriver ? ['build-driver.mjs'] : []), 'build-output.mjs', 'build-keyboard.mjs']) console.log(run(process.execPath, ['desktop/' + script]));
 const work = await mkdtemp(path.join(root, 'build/package-'));
 const payload = path.join(work, 'payload');
@@ -136,19 +143,43 @@ await writeFile(path.join(uninstallResources, 'welcome.html'), `<!doctype html><
 <p>系统可能把最后一步显示为“安装”：此包只执行卸载，不安装另一个客户端。继续即授权移除上述两个组件。</p></body></html>`);
 const uninstallDistribution = path.join(work, 'Uninstall.xml');
 await writeFile(uninstallDistribution, `<?xml version="1.0" encoding="utf-8"?>
-<installer-gui-script minSpecVersion="2"><title>卸载 NoKey（开发版）</title>
+<installer-gui-script minSpecVersion="2"><title>卸载 NoKey${release ? '' : '（开发版）'}</title>
 <options customize="never" require-scripts="true"/><domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
 <welcome file="welcome.html" mime-type="text/html"/><choices-outline><line choice="uninstall"/></choices-outline>
 <choice id="uninstall" visible="false"><pkg-ref id="${identifier}.uninstaller"/></choice>
 <pkg-ref id="${identifier}.uninstaller" version="${version}" onConclusion="RequireRestart">uninstall-component.pkg</pkg-ref>
 </installer-gui-script>`);
-run('productbuild', ['--distribution', uninstallDistribution, '--resources', uninstallResources, '--package-path', work,
+run('productbuild', [...installerSigning, '--distribution', uninstallDistribution, '--resources', uninstallResources, '--package-path', work,
   path.join(resources, 'VoiceDeck-Uninstall.pkg')]);
-console.log('Client and precompiled helper staged; signing the local development bundle.');
-run('codesign', ['--force', '--deep', '--sign', signingIdentity, bundle]);
+// Developer ID signing must proceed inside out, including native Node modules.
+const entitlements = path.join(work, 'electron-entitlements.plist');
+if (release) await writeFile(entitlements, '<?xml version="1.0"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.cs.allow-jit</key><true/></dict></plist>');
+const machOMagic = new Set(['feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca']);
+async function signDistribution(directory) {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const file = path.join(directory, entry.name);
+    if (entry.isDirectory()) await signDistribution(file);
+    else if (entry.isFile()) {
+      const handle = await open(file, 'r'), magic = Buffer.alloc(4);
+      try { await handle.read(magic, 0, 4, 0); } finally { await handle.close(); }
+      if (machOMagic.has(magic.toString('hex')))
+        run('codesign', ['--force', '--timestamp', '--options', 'runtime', '--sign', signingIdentity, file]);
+    }
+  }
+  if (/\.(app|framework|bundle|xpc|driver)$/.test(directory)) {
+    const jit = directory.endsWith('.app') ? ['--entitlements', entitlements] : [];
+    run('codesign', ['--force', '--timestamp', '--options', 'runtime', ...jit, '--sign', signingIdentity, directory]);
+  }
+}
+console.log(`Signing ${release ? 'Developer ID distribution' : 'development'} bundle…`);
+if (release) await signDistribution(bundle);
+else run('codesign', ['--force', '--deep', '--sign', signingIdentity, bundle]);
 run('codesign', ['--verify', '--deep', '--strict', bundle]);
 const driverRelative = 'Library/Audio/Plug-Ins/HAL/VoiceDeckMicrophone.driver';
-if (withDriver) await copy(path.join(root, 'build/desktop/VoiceDeckMicrophone.driver'), path.join(payload, driverRelative));
+if (withDriver) {
+  await copy(path.join(root, 'build/desktop/VoiceDeckMicrophone.driver'), path.join(payload, driverRelative));
+  if (release) await signDistribution(path.join(payload, driverRelative));
+}
 const components = path.join(work, 'components.plist');
 run('pkgbuild', ['--analyze', '--root', payload, components]);
 const analyzed = JSON.parse(run('plutil', ['-convert', 'json', '-o', '-', components]));
@@ -182,12 +213,12 @@ await writeFile(path.join(installerResources, 'welcome.html'), `<!doctype html><
 <h1>NoKey</h1><p>安装一个 Mac 客户端和配套虚拟麦克风，接收已配对 iPhone 的语音与快捷操作。</p>
 <p>安装位置：/Applications/NoKey.app 和 /Library/Audio/Plug-Ins/HAL/VoiceDeckMicrophone.driver。</p>
 <p>完成后需重新启动 Mac，让系统加载虚拟麦克风。请先保存正在进行的工作。安装器不会建立登录项或更改默认麦克风。</p>
-<p>这是尚未完成 Developer ID 签名、公证与真机验收的开发包，不是公开发布版。</p></body></html>`);
+<p>${release ? 'NoKey 使用 Developer ID 签名。请从项目官方发布页下载，查看版本和校验信息。' : '这是尚未完成 Developer ID 签名、公证与真机验收的开发包，不是公开发布版。'}</p></body></html>`);
 if (!withDriver) await writeFile(path.join(installerResources, 'welcome.html'), `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><body>
 <h1>NoKey客户端更新</h1><p>仅更新 /Applications/NoKey.app，保留配对和现有虚拟麦克风。</p>
 <p>退出客户端后安装，完成后重新打开即可，无需重启 Mac。本包不包含驱动，首次安装请使用完整安装包。</p>
-<p>不建立登录项，不更改默认音源。这是本地签名开发包。</p></body></html>`);
-const pkg = path.join(work, `VoiceDeck-${version}-${process.arch}-${withDriver ? 'full' : 'client-update'}-dev.pkg`);
-run('productbuild', ['--distribution', distribution, '--resources', installerResources, '--package-path', work, pkg]);
-await writeFile(path.join(root, 'build/desktop/package-latest.json'), JSON.stringify({ work, bundle, pkg, withDriver, signingIdentity, arch: process.arch, version }, null, 2));
-console.log(JSON.stringify({ bundle, pkg, status: 'development-only; not installed, Developer ID signed or notarized' }));
+<p>不建立登录项，不更改默认音源。${release ? '使用 Developer ID 分发签名。' : '这是本地签名开发包。'}</p></body></html>`);
+const pkg = path.join(work, `${release ? 'NoKey' : 'VoiceDeck'}-${version}-${process.arch}-${withDriver ? 'full' : 'client-update'}${release ? '' : '-dev'}.pkg`);
+run('productbuild', [...installerSigning, '--distribution', distribution, '--resources', installerResources, '--package-path', work, pkg]);
+await writeFile(path.join(root, 'build/desktop/package-latest.json'), JSON.stringify({ work, bundle, pkg, withDriver, release, signingIdentity, installerIdentity: release ? installerIdentity : null, arch: process.arch, version }, null, 2));
+console.log(JSON.stringify({ bundle, pkg, status: release ? 'Developer ID signed; not yet notarized or installed' : 'development-only; not installed, Developer ID signed or notarized' }));

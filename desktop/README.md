@@ -44,3 +44,12 @@ RTC 检查使用真实 WebRTC 测试音与输出替身，不采集本机麦克�
 强制中继检查：先 `npm run desktop:turn:build`，再 `npm run desktop:turn:test`；TCP 可用 `VOICEDECK_TURN_TRANSPORT=tcp npm run desktop:turn:test`。构建器校验下载源码哈希，需要 pkg-config / OpenSSL，可用 `OPENSSL_PREFIX` 指定。coturn 仅在测试期间监听回环，结束后停止；已有程序可用 `COTURN_BINARY` 指定。本机 UDP / TCP 三轮音频检查已通过，公网 TURN-TLS、运营商跨网和持续弱网仍待验证。
 
 Web 界面集成需先在 mobile 导出 build/mobile-export，再运行 `npm run desktop:mobile:test`，使用按键替身，不能替代真机触屏和系统输入测试。
+
+
+## Developer ID 分发构建
+
+`npm run desktop:package -- --with-driver --release` 生成首次安装完整包；不带 `--with-driver` 生成客户端更新包。两者只构建，不安装、不提交公证或自动发布。需本机有效 Developer ID Application 和 Developer ID Installer；多证书时通过 `VOICEDECK_SIGN_IDENTITY` 与 `VOICEDECK_INSTALLER_IDENTITY` 指定对应SHA1。
+
+正式路径由内向外签署所有 Mach-O、原生 Node 模块、应用及驱动，启用 Hardened Runtime 和时间戳；Electron 应用仅增加 allow-jit，未加入 get-task-allow 或关闭库验证。安装器及内置卸载器使用 Developer ID Installer。`npm run desktop:package:test` 检查发行证书类型、时间戳、运行时及真实隔离启动。
+
+构建成功仍不代表公证完成。用系统 `xcrun notarytool submit <pkg> --keychain-profile NoKey-Notary` 提交（凭据由使用者交互存入钥匙串）；Accepted 后对同一 pkg 执行 `xcrun stapler staple`、`xcrun stapler validate`、`spctl --assess --type install`。以最终附票据的文件生成校验和。不要将开发包公开标记为正式发行。
