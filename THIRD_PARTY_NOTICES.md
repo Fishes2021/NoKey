@@ -11,7 +11,7 @@ NoKey 新增代码、修改及组合作品按 GPL-3.0-only 发布，完整条款
 | Expo / React Native / react-native-webrtc | 手机运行时、原生模块与媒体传输 | 依赖包各自许可证，版本锁定于 mobile/package-lock.json |
 | coturn / libevent | 自部署及本机中继测试 | 上游许可证随源码/软件包保留；本仓库包含构建和部署脚本，不分发其官方安装器 |
 
-npm 依赖的精确版本、来源和完整性值见各 package-lock.json，安装后可查看包内 LICENSE。二进制发布时还需要收集随包的完整传递依赖及字体许可，本次源码发布不附带这些第三方二进制。
+npm 依赖的精确版本、来源和完整性值见各 package-lock.json，安装后可查看包内 LICENSE。Mac 安装包在 Contents/Resources/Licenses 中附带运行时、直接运行依赖及 Microdex/BlackHole 的声明。手机依赖及字体另按手机发布包核对；Mac 声明不替代手机端的完整清单。
 
 BlackHole 官方二进制及品牌有独立限制。本项目从公开源码编译自己的虚拟设备，不分发官方安装器，不使用其图标作为 NoKey 图标。NoKey 图标源在 desktop/assets/build-icons.swift。
 

@@ -5,7 +5,7 @@ let host = null;
 // without a media engine; voice endpoints then return a clear 503.
 export function setVoiceHost(value) { host = value; }
 
-export async function handleVoiceRequest(context, audioHost = host) {
+export async function handleVoiceRequest(context, audioHost = host, startDictation = null) {
   const payload = context?.payload;
   if (typeof payload?.path !== 'string' || !payload.path.startsWith('/api/voice/')) return null;
   const response = (status, body) => ({ status, contentType: 'application/json; charset=utf-8', body: JSON.stringify(body) });
@@ -28,10 +28,13 @@ export async function handleVoiceRequest(context, audioHost = host) {
     if (operation === 'gain' && (!Number.isFinite(body.gain) || body.gain < 0 || body.gain > 4))
       return response(400, { error: '音量范围为 0–4' });
   }
+  if (operation === 'offer' && body.dictationLeaseId !== undefined &&
+      (typeof body.dictationLeaseId !== 'string' || !/^[A-Za-z0-9_-]{16,64}$/.test(body.dictationLeaseId)))
+    return response(400, { error: '听写目标标识无效' });
   if (!audioHost) return response(503, { error: '请启动语音快捷键盘 Mac 客户端' });
   try {
     const result = operation === 'config' ? await audioHost.config(owner) : operation === 'offer'
-      ? await audioHost.offer(owner, { type: body.description.type, sdp: body.description.sdp })
+      ? await audioHost.offer(owner, { type: body.description.type, sdp: body.description.sdp }, body.dictationLeaseId && startDictation ? shortcut => startDictation(body.dictationLeaseId, shortcut) : null)
       : await audioHost.control(operation, owner, { sessionId: body.sessionId, gain: body.gain, ...(operation === 'restart' ? { description: { type: body.description.type, sdp: body.description.sdp } } : {}) });
     return response(200, result);
   } catch (error) {

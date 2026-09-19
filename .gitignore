@@ -1,7 +1,7 @@
 # Dipendenze
-node_modules/
-mobile/node_modules/
-web/node_modules/
+node_modules
+mobile/node_modules
+web/node_modules
 
 # Build e cache
 dist/

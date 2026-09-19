@@ -1,4 +1,6 @@
 import Constants from 'expo-constants';
+import { ConnectionRoutes } from './connection-routes.mjs';
+import { normalizeBridgeUrl } from './pairing.ts';
 
 import {
   type E2EEEnvelope,
@@ -127,6 +129,7 @@ type RequestOptions = {
   method?: 'GET' | 'POST';
   body?: Record<string, unknown>;
   timeoutMs?: number;
+  signal?: AbortSignal;
 };
 
 type E2EESession = {
@@ -201,7 +204,7 @@ async function ensureE2EESession(
           '此 Mac 已拒绝当前配对。请在 Mac 客户端刷新二维码，再用手机重新配对。',
         );
       }
-      throw new BridgeConnectionError(result.error || '加密连接未能建立，请检查 Mac 客户端和连接服务状态。');
+      throw bridgeErrorForStatus(response.status, result);
     }
     const payload = openE2EE<E2EESession>(
       material,
@@ -221,7 +224,7 @@ async function ensureE2EESession(
   try {
     return await pending;
   } catch (error) {
-    e2eeSessions.delete(key);
+    if (e2eeSessions.get(key) === pending) e2eeSessions.delete(key);
     throw error;
   }
 }
@@ -235,10 +238,13 @@ function bridgeErrorForStatus(status: number, payload: { error?: string; code?: 
         : '此 Mac 已拒绝保存的授权。请在 Mac 客户端刷新二维码，再用手机重新配对。',
     );
   }
+  if (payload.code === 'RELAY_SUBSCRIPTION_REQUIRED' || payload.code === 'RELAY_INACTIVE') {
+    return Object.assign(new BridgeConnectionError('中继服务尚未授权、已到期或已停用。请在 Mac 查看授权；局域网仍可使用。'), { code: payload.code });
+  }
   if (status === 503 && payload.code === 'MAC_OFFLINE') {
-    return new BridgeConnectionError(
-      'Mac 已离线或进入睡眠。请唤醒 Mac 并打开语音快捷键盘，手机会尝试恢复连接。',
-    );
+    return Object.assign(new BridgeConnectionError(
+      'Mac 未连接，请唤醒 Mac 并打开 NoKey。',
+    ), { code: 'MAC_OFFLINE' });
   }
   return Object.assign(new Error(message), { statusCode: status });
 }
@@ -357,7 +363,7 @@ export function resetEncryptedBridgeSession(
   clearE2EESession(bridgeUrl, material);
 }
 
-export async function bridgeRequest<T>(
+async function directBridgeRequest<T>(
   bridgeUrl: string,
   token: string,
   path: string,
@@ -365,7 +371,10 @@ export async function bridgeRequest<T>(
   e2ee?: E2EEKeyMaterial | null,
 ) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 20_000);
+  const cancel = () => controller.abort();
+  options.signal?.addEventListener('abort', cancel, { once: true });
+  if (options.signal?.aborted) cancel();
+  const timeout = setTimeout(cancel, options.timeoutMs ?? 20_000);
   const encryption = e2ee ?? registeredEncryption.get(normalizedBridgeKey(bridgeUrl));
 
   try {
@@ -449,5 +458,56 @@ export async function bridgeRequest<T>(
     throw error;
   } finally {
     clearTimeout(timeout);
+    options.signal?.removeEventListener('abort', cancel);
+  }
+}
+
+let discoverBridges: (signal: AbortSignal) => Promise<string[]> = async () => [];
+export function setBridgeDiscovery(discover: typeof discoverBridges) { discoverBridges = discover; }
+const routeStates = new Map<string, ConnectionRoutes>();
+const routeListeners = new Set<(keyId: string, addresses: string[]) => void>();
+export function onBridgeRoutesChanged(listener: (keyId: string, addresses: string[]) => void) {
+  routeListeners.add(listener); return () => { routeListeners.delete(listener); };
+}
+export function configureBridgeRoutes(base: string, token: string, material: E2EEKeyMaterial, candidates: unknown) {
+  if (!Array.isArray(candidates) || candidates.length > 12) return;
+  let addresses: string[];
+  try { addresses = [...new Set([base, ...candidates].map(value => normalizeBridgeUrl(String(value))))].slice(0, 12); }
+  catch { return; }
+  const key = material.keyId;
+  const previous = routeStates.get(key);
+  if (previous) {
+    if (JSON.stringify(previous.routes) === JSON.stringify(addresses)) return;
+    previous.update(addresses);
+  } else {
+    routeStates.set(key, new ConnectionRoutes(addresses, async (address, signal) => {
+      const response = await directBridgeRequest<{ routes?: string[] }>(address, token, '/api/connection', { signal, timeoutMs: 2500 }, material);
+      if (response.routes) configureBridgeRoutes(base, token, material, response.routes);
+    }, signal => discoverBridges(signal)));
+  }
+  for (const listener of routeListeners) listener(key, addresses);
+}
+export function resetBridgeRoute(material: E2EEKeyMaterial | null, active = true) { if (material) routeStates.get(material.keyId)?.reset(active); }
+export function currentBridgeRoute(material: E2EEKeyMaterial | null) { return material ? routeStates.get(material.keyId)?.selected ?? null : null; }
+export async function bridgeRequest<T>(base: string, token: string, path: string, options: RequestOptions = {}, e2ee?: E2EEKeyMaterial | null): Promise<T> {
+  const material = e2ee ?? registeredEncryption.get(normalizedBridgeKey(base));
+  if (!material) return directBridgeRequest(base, token, path, options, e2ee);
+  const router = routeStates.get(material.keyId);
+  // Legacy bindings learn routes on their first successful authenticated response.
+  const request = async (address: string) => {
+    const result = await directBridgeRequest<T & { routes?: string[] }>(address, token, path, options, material);
+    if (result?.routes) configureBridgeRoutes(base, token, material, result.routes);
+    return result;
+  };
+  if (!router) return request(base);
+  const address = path === '/api/voice/stop' ? router.selected || router.lastSelected || base : await router.select(options.signal);
+  try { return await request(address); }
+  catch (error) {
+    if (options.signal?.aborted || !router.active) throw error;
+    const safe = (options.method ?? 'GET') === 'GET' || ['/api/keyboard/target', '/api/voice/config', '/api/voice/status'].includes(path);
+    if (!(error instanceof BridgeConnectionError) && !(error instanceof TypeError)) throw error;
+    router.reset();
+    if (!safe) throw error; // Never replay a key, text, pairing claim or voice toggle.
+    return request(await router.select(options.signal));
   }
 }

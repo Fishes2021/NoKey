@@ -1,3 +1,4 @@
+import { KEY_CODES, keyboardKeyLabel } from '../../mobile/lib/keyboard-shortcuts.mjs';
 import { VoiceReceiver } from './receiver.js';
 const receiver = new VoiceReceiver({ onPCM: window.voiceEngine.pcm,
   onClear: window.voiceEngine.clear, onClosed: window.voiceEngine.closed });
@@ -37,6 +38,34 @@ const renderAudio = () => {
   if (receiver.lastError) document.getElementById('audio-error').textContent = receiver.lastError;
 };
 let desktopState, connectionDirty = false;
+let dictationDirty = false;
+const dictationKey = document.getElementById('dictation-key');
+for (const key of Object.keys(KEY_CODES)) {
+  const option = document.createElement('option'); option.value = key; option.textContent = keyboardKeyLabel(key); dictationKey.append(option);
+}
+for (const name of ['command', 'control', 'option', 'shift']) {
+  const label = document.createElement('label'), input = document.createElement('input');
+  input.type = 'checkbox'; input.value = name; input.name = 'dictation-modifier';
+  label.append(input, name[0].toUpperCase() + name.slice(1)); document.getElementById('dictation-modifiers').append(label);
+}
+const updateModifiers = () => {
+  const single = /^(Left|Right)(Option|Control|Shift|Command)$/.test(dictationKey.value);
+  for (const box of document.querySelectorAll('[name="dictation-modifier"]')) { box.disabled = single; if (single) box.checked = false; }
+};
+document.getElementById('dictation-form').addEventListener('input', () => { dictationDirty = true; updateModifiers(); });
+document.getElementById('dictation-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector('button'); button.disabled = true;
+  try {
+    const state = await window.desktopClient.action('dictation-save', { key: dictationKey.value,
+      modifiers: [...document.querySelectorAll('[name="dictation-modifier"]:checked')].map(box => box.value),
+      sendDelayMs: Number(document.getElementById('dictation-delay').value) });
+    dictationDirty = false; renderDesktop(state);
+    document.getElementById('dictation-status').textContent = '已保存，下次讲话生效；当前讲话沿用开始时的设置。';
+  } catch (error) { document.getElementById('dictation-status').textContent = error.message; }
+  finally { button.disabled = false; }
+});
+
 const renderExpiry = () => {
   if (!desktopState) return;
   const remaining = Math.max(0, Math.ceil((desktopState.expiresAt - Date.now()) / 1000));
@@ -62,10 +91,22 @@ const renderNetwork = () => {
 const renderDesktop = state => {
   if (!state) return;
   desktopState = state;
+  if (!dictationDirty && state.dictation) {
+    dictationKey.value = state.dictation.key;
+    document.getElementById('dictation-delay').value = state.dictation.sendDelayMs;
+    for (const box of document.querySelectorAll('[name="dictation-modifier"]')) box.checked = state.dictation.modifiers.includes(box.value);
+    updateModifiers();
+  }
+  if (state.dictationError) document.getElementById('dictation-status').textContent = state.dictationError;
   document.getElementById('summary-phone').textContent = state.devices?.length ? `● 已配对 ${state.devices.length} 台手机` : '○ 尚未配对手机';
   document.getElementById('summary-network').textContent = state.remoteReady ? '异网服务已连接' : state.relayConfigured ? '异网服务连接中' : '局域网 · 等待手机使用';
   document.getElementById('summary-input').textContent = `当前输入 ${state.microphone?.devices?.find(device => device.selected)?.name || '未知'}`;
   document.getElementById('summary-keyboard').textContent = !state.keyboardEnabled ? '未启用' : state.keyboardTrusted ? '已启用' : '需要授权';
+  const subscription = state.subscription;
+  document.getElementById('subscription-status').textContent = !state.relayConfigured && !state.connectionRestartRequired ? '当前使用局域网，无需授权'
+    : !subscription ? '尚未检查中继授权' : subscription.status === 'active'
+      ? subscription.expiresAt ? `有效至 ${new Date(subscription.expiresAt).toLocaleString()}（服务端校验）` : '已登记的试用设备'
+      : ({ expired: '中继已到期，局域网仍可使用', revoked: '中继授权已停用', inactive: '中继尚未激活' })[subscription.status];
   const login = state.loginItem;
   document.getElementById('login-enable').disabled = !login?.available || ['enabled', 'requires-approval'].includes(login.status);
   document.getElementById('login-disable').disabled = !login?.available || ['not-registered', 'not-found'].includes(login.status);
@@ -176,3 +217,16 @@ document.getElementById('pair-open').addEventListener('click', () => {
   showSettings(true); document.getElementById('pair-section').scrollIntoView();
 });
 document.getElementById('restore-quick').addEventListener('click', () => document.getElementById('microphone-restore').click());
+
+for (const action of ['subscription-activate', 'subscription-check']) {
+  document.getElementById(action).addEventListener('click', async () => {
+    const buttons = ['subscription-activate', 'subscription-check'].map(id => document.getElementById(id));
+    buttons.forEach(button => { button.disabled = true; });
+    try {
+      const code = action === 'subscription-activate' ? document.getElementById('subscription-code').value.trim() : undefined;
+      renderDesktop(await window.desktopClient.action(action, code));
+      if (code) document.getElementById('subscription-code').value = '';
+    } catch (error) { document.getElementById('subscription-status').textContent = error.message; }
+    finally { buttons.forEach(button => { button.disabled = false; }); }
+  });
+}

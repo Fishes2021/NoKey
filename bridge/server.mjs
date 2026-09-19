@@ -1,8 +1,9 @@
+import { createKeyPreferences } from './lib/key-preferences.mjs';
 import { confirmPairingWithDeadline } from './lib/pairing-confirmation.mjs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 
@@ -41,7 +42,7 @@ import {
   E2EEClientRegistry,
 } from './lib/e2ee-client-registry.mjs';
 import { openE2EE, sealE2EE } from './lib/e2ee.mjs';
-import { createRemoteRelay, safeLocalApiPath } from './lib/remote-relay.mjs';
+import { createRemoteRelay, safeLocalApiPath, persistentRelayIdentity, relayDeviceUrl } from './lib/remote-relay.mjs';
 import { createKeyboardController } from './lib/keyboard-api.mjs';
 import { handleVoiceRequest } from './lib/voice-api.mjs';
 import { createControlSession } from './lib/control-session.mjs';
@@ -83,6 +84,8 @@ const backgroundMode = process.env.MICRODEX_BACKGROUND === '1';
 const remoteAccessEnabled = options.remoteAccess ?? (embedded ? false : process.env.MICRODEX_REMOTE_ACCESS !== '0');
 const quickTunnelEnabled =
   !embedded && remoteAccessEnabled && process.env.MICRODEX_QUICK_TUNNEL === '1';
+const configuredRelayAddress = options.relayOrigin ? relayDeviceUrl(options.relayOrigin, (await persistentRelayIdentity(microdexHome)).deviceId) : null;
+const keyPreferences = await createKeyPreferences(microdexHome);
 let pairingSession = new PairingSession({ accessToken });
 let closing = false;
 let pairingMode = 'standard';
@@ -94,8 +97,23 @@ async function handleAuthenticatedRequest(context) {
   e2eeClients.assertActive(context);
   const invoke = async () => {
     e2eeClients.assertActive(context);
-    const handled = keyboardController.handle(context) || await handleVoiceRequest(context);
-    if (handled) return handled;
+    if (context.payload.method === 'GET' && context.payload.path === '/api/connection') return { status: 200, body: JSON.stringify({ routes: connectionAddresses() }) };
+    if (context.payload.path === '/api/preferences/keys') {
+      try {
+        const result = context.payload.method === 'GET' ? keyPreferences.read() : context.payload.method === 'POST' ? await keyPreferences.save(context.payload.body) : null;
+        return { status: result ? 200 : 405, body: JSON.stringify(result || { error: '不支持的请求方法' }) };
+      } catch (error) { return { status: error.statusCode || 503, body: JSON.stringify({ error: error.statusCode ? error.message : '快捷配置保存失败，原配置保留' }) }; }
+    }
+    const handled = keyboardController.handle(context) || await handleVoiceRequest(context, undefined, (leaseId, shortcut) => {
+      e2eeClients.assertActive(context);
+      if (closing) throw new Error('客户端已停止');
+      return keyboardController.handle({ ...context, payload: { method: 'POST', path: '/api/keyboard/press',
+        body: { leaseId, operationId: randomUUID(), ...shortcut } } });
+    });
+    if (handled) {
+      if (context.payload.path === '/api/keyboard/target' && handled.status === 200) handled.body = JSON.stringify({ ...JSON.parse(handled.body), routes: connectionAddresses() });
+      return handled;
+    }
     e2eeClients.assertActive(context);
     const requestedPath = safeLocalApiPath(context.payload.path);
     if (!requestedPath || requestedPath.startsWith('/api/e2ee')) throw Object.assign(new Error('无效请求路径'), { statusCode: 400 });
@@ -116,6 +134,7 @@ const stableRelay = createRemoteRelay({
   authenticate: tokenMatches,
   e2eeClients,
   claimEncryptedPairing,
+  probeEncryptedPairing,
   handleAuthenticatedRequest,
   allowLegacy: !embedded && process.env.MICRODEX_ALLOW_LEGACY_REMOTE === '1',
   enabled: remoteAccessEnabled,
@@ -189,6 +208,12 @@ function tokenMatches(provided = '', token = accessToken) {
   return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
+function probeEncryptedPairing(envelope) {
+  const material = pairingSession.encryption;
+  const payload = openE2EE(material, 'pair-probe', envelope);
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(payload.requestId || '') || !Number.isFinite(payload.issuedAt) || Math.abs(Date.now() - payload.issuedAt) > 60000 || !pairingSession.validate(payload.code).ok) throw new E2EEAuthenticationError();
+  return { envelope: sealE2EE(material, `pair-probe-response:${payload.requestId}`, { ok: true }) };
+}
 async function claimEncryptedPairing(envelope) {
   const invitation = pairingSession;
   const material = invitation.encryption;
@@ -254,6 +279,7 @@ async function readBody(request) {
 }
 
 async function handleDirectEncryptedRequest(pathname, body) {
+  if (pathname === '/api/e2ee/pair-probe') return probeEncryptedPairing(body.envelope);
   if (pathname === '/api/e2ee/pair') return claimEncryptedPairing(body.envelope);
   if (pathname === '/api/e2ee/session') {
     const session = await e2eeClients.createSession(body.envelope, tokenMatches);
@@ -282,6 +308,7 @@ async function publicStatus() {
   }
   return {
     connected: true,
+    routes: connectionAddresses(),
     device: { name: os.hostname() },
     bridge: {
       name: BRIDGE_NAME,
@@ -508,18 +535,23 @@ function bridgeAddresses() {
   return addresses.length ? addresses : [`http://127.0.0.1:${port}`];
 }
 
+function connectionAddresses() {
+  const localAddresses = bridgeAddresses().filter(address => /^http:\/\/(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|127\.)/.test(address)).slice(0, 8);
+  const name = os.hostname().replace(/\.local$/i, '');
+  if (/^[A-Za-z0-9-]+$/.test(name)) localAddresses.push(`http://${name}.local:${port}`);
+  return [...new Set([...localAddresses, configuredRelayAddress || remoteTunnelState.url].filter(Boolean))].slice(0, 10);
+}
 function pairingDetails() {
   const localAddresses = bridgeAddresses();
   const remoteAddress = remoteTunnelState.ready ? remoteTunnelState.url : null;
-  const addresses = remoteAddress
-    ? [remoteAddress, ...localAddresses.filter((address) => address !== remoteAddress)]
-    : localAddresses;
+  const addresses = localAddresses; // A single stable QR carries every candidate in its pairing fragment.
   const urls = addresses.map((address) => {
     const pairingUrl = new URL(`${address.replace(/\/$/, '')}/pair`);
     pairingUrl.searchParams.set('code', pairingSession.code);
     const encryption = pairingSession.encryption;
     pairingUrl.hash = new URLSearchParams({
       e2ee: '1',
+      routes: JSON.stringify(connectionAddresses()),
       deviceName: os.hostname(),
       keyId: encryption.keyId,
       key: encryption.key,
@@ -528,7 +560,7 @@ function pairingDetails() {
   });
   return {
     pairingUrl: urls[0],
-    pairingUrls: urls,
+    pairingUrls: [urls[0]],
     expiresAt: pairingSession.expiresAt,
     mode: pairingMode,
     singleUse: true,
@@ -606,7 +638,7 @@ p{opacity:.75;line-height:1.45;max-width:28rem}</style></head>
 <a id="open-microdex" href="${escapedDeepLink}">打开语音快捷键盘</a>
 </div><script nonce="${nonce}">
 const link=document.getElementById('open-microdex');const fragment=new URLSearchParams(location.hash.slice(1));
-if(fragment.get('e2ee')==='1'&&fragment.get('keyId')&&fragment.get('key')){const target=new URL(link.href);target.searchParams.set('e2ee','1');target.searchParams.set('keyId',fragment.get('keyId'));target.searchParams.set('key',fragment.get('key'));if(fragment.get('deviceName'))target.searchParams.set('deviceName',fragment.get('deviceName'));link.href=target.toString();}
+if(fragment.get('e2ee')==='1'&&fragment.get('keyId')&&fragment.get('key')){const target=new URL(link.href);target.searchParams.set('e2ee','1');target.searchParams.set('keyId',fragment.get('keyId'));target.searchParams.set('key',fragment.get('key'));if(fragment.get('routes'))target.searchParams.set('routes',fragment.get('routes'));if(fragment.get('deviceName'))target.searchParams.set('deviceName',fragment.get('deviceName'));link.href=target.toString();}
 </script></body></html>`;
       response.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
@@ -620,7 +652,7 @@ if(fragment.get('e2ee')==='1'&&fragment.get('keyId')&&fragment.get('key')){const
 
     if (
       request.method === 'POST' &&
-      ['/api/e2ee/pair', '/api/e2ee/session', '/api/e2ee'].includes(url.pathname)
+      ['/api/e2ee/pair-probe', '/api/e2ee/pair', '/api/e2ee/session', '/api/e2ee'].includes(url.pathname)
     ) {
       const body = await readBody(request);
       return sendJson(response, 200, await handleDirectEncryptedRequest(url.pathname, body));

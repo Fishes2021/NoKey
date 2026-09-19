@@ -12,6 +12,8 @@ import { createMicrophoneSelection } from './microphone-selection.mjs';
 import { createVoiceHost } from './voice-host.mjs';
 import { startBridge } from '../bridge/server.mjs';
 import { setVoiceHost } from '../bridge/lib/voice-api.mjs';
+import { DEFAULT_DICTATION, normalizeDictation } from './dictation-settings.mjs';
+import { subscriptionRequest } from './subscription-client.mjs';
 import { normalizeRelayOrigin } from '../bridge/lib/remote-relay.mjs';
 const require = createRequire(import.meta.url);
 const QRCode = require('qrcode-terminal/vendor/QRCode');
@@ -53,20 +55,30 @@ export async function startDesktop({ stateDir = app.getPath('userData'), show = 
     relayOrigin = config.relayOrigin ? normalizeRelayOrigin(config.relayOrigin) : undefined;
     config.relayOrigin = relayOrigin || '';
   } catch (error) { if (error.code !== 'ENOENT') configError = true; }
-  let savingConnection = false;
+  let savingConnection = false, subscriptionBusy = false, subscription = null;
+  const keyboardPreferencePath = path.join(stateDir, 'keyboard-enabled.json');
+  let keyboardEnabled = false;
+  try { keyboardEnabled = JSON.parse(await readFile(keyboardPreferencePath, 'utf8')) === true; }
+  catch (error) { if (error.code !== 'ENOENT') throw new Error('快捷控制设置读取失败，请检查客户端设置文件'); }
   const output = require('../build/desktop/voice-output.node');
   const keyboard = require('../build/desktop/keyboard.node');
+  const dictationPath = path.join(stateDir, 'dictation.json');
+  let dictation = normalizeDictation(DEFAULT_DICTATION), dictationError = '', savingDictation = false;
+  try { dictation = normalizeDictation(JSON.parse(await readFile(dictationPath, 'utf8'))); }
+  catch (error) { if (error.code !== 'ENOENT') dictationError = '语音快捷键配置无法读取，请重新保存设置'; }
   const microphone = await createMicrophoneSelection(output, stateDir);
-  const voice = await createVoiceHost({ microphone, keyboard, show, getIceConfig: createIceProvider({ relayOrigin, stateDir }) });
+  const voice = await createVoiceHost({ microphone, keyboard, show, getDictationSettings: () => { if (dictationError) throw new Error(dictationError); return dictation; }, getIceConfig: createIceProvider({ relayOrigin, stateDir }) });
   const window = voice.window;
   window.setSize(430, 560);
   window.setMinimumSize(390, 480);
   let tray;
   let stateTimer;
-  let bridge, closing, shortcuts = false, keyboardEnabled = false, devices = [];
+  let bridge, closing, shortcuts = false, devices = [];
+  let savingKeyboard = false;
   const snapshot = details => {
     const deviceStatus = output.probe();
     return ({
+    subscription, dictation, dictationError,
     microphone: microphone.snapshot(),
     deviceName: os.hostname(),
     qr: qrImage(details.pairingUrl), pairingText: details.pairingUrl, expiresAt: details.expiresAt,
@@ -92,11 +104,13 @@ export async function startDesktop({ stateDir = app.getPath('userData'), show = 
     event.senderFrame === window.webContents.mainFrame;
   const close = () => closing ??= Promise.resolve().then(async () => {
     clearInterval(stateTimer);
+    keyboard.advertise?.(0);
     tray?.destroy();
     ipcMain.removeHandler('desktop:action');
     setVoiceHost(null);
     await voice.close();
     await bridge?.close();
+    await microphone.restore().catch(() => {});
     const pending = microphone.snapshot();
     if (pending.recovery) await dialog.showMessageBox({ type: 'warning', title: '原麦克风尚未恢复',
       message: pending.message || '请重新连接原麦克风，或下次打开客户端选择恢复设备。',
@@ -119,6 +133,8 @@ export async function startDesktop({ stateDir = app.getPath('userData'), show = 
         });
         return response === 1 && !window.isDestroyed();
       }), onPairingChanged: publish });
+    bridge.setKeyboardEnabled(keyboardEnabled);
+    keyboard.advertise?.(bridge.port);
     if (window.isDestroyed()) throw new Error('客户端窗口已关闭');
     ipcMain.handle('desktop:action', async (event, action, keyId) => {
       if (!trusted(event)) throw new Error('未授权窗口');
@@ -134,10 +150,39 @@ export async function startDesktop({ stateDir = app.getPath('userData'), show = 
       }
       else if (action === 'login-enable') setLoginItem(app, true);
       else if (action === 'login-disable') setLoginItem(app, false);
-      else if (action === 'keyboard') { keyboardEnabled = !keyboardEnabled; bridge.setKeyboardEnabled(keyboardEnabled); }
+      else if (action === 'keyboard') {
+        if (savingKeyboard) throw new Error('正在保存快捷控制设置，请稍候');
+        savingKeyboard = true;
+        const temporary = `${keyboardPreferencePath}.tmp`;
+        try {
+          const next = !keyboardEnabled;
+          await writeFile(temporary, JSON.stringify(next) + '\n', { mode: 0o600 });
+          await rename(temporary, keyboardPreferencePath);
+          keyboardEnabled = next; bridge.setKeyboardEnabled(next);
+        } finally { savingKeyboard = false; await rm(temporary, { force: true }); }
+      }
+      else if (action === 'dictation-save') {
+        if (savingDictation) throw new Error('正在保存语音快捷键');
+        const next = normalizeDictation(keyId);
+        savingDictation = true;
+        const temporary = `${dictationPath}.tmp`;
+        try {
+          await writeFile(temporary, JSON.stringify(next) + '\n', { mode: 0o600 });
+          await rename(temporary, dictationPath);
+          dictation = next; dictationError = '';
+        } finally { savingDictation = false; await rm(temporary, { force: true }); }
+      }
       else if (action === 'keyboard-permission') {
         // Open the actual setting; repeated AX prompt dialogs do not repair a stale grant.
         await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility');
+      }
+      else if (action === 'subscription-activate' || action === 'subscription-check') {
+        if (subscriptionBusy) throw new Error('正在检查中继授权，请稍候');
+        if (!config.relayOrigin) throw new Error('请先填写并保存服务地址；局域网不需要激活');
+        subscriptionBusy = true;
+        try { subscription = await subscriptionRequest({ origin: config.relayOrigin, stateDir,
+          ...(action === 'subscription-activate' ? { code: keyId } : {}) }); }
+        finally { subscriptionBusy = false; }
       }
       else if (action === 'connection-save') {
         if (savingConnection) throw new Error('正在保存连接设置，请稍候');
@@ -156,7 +201,7 @@ export async function startDesktop({ stateDir = app.getPath('userData'), show = 
             configBackup = name;
           }
           await rename(temporary, configPath);
-          config = next; configError = false;
+          config = next; configError = false; subscription = null;
         } finally { savingConnection = false; await rm(temporary, { force: true }); }
       }
       else if (action === 'uninstall') {
@@ -205,6 +250,7 @@ export async function startDesktop({ stateDir = app.getPath('userData'), show = 
         { label: '退出 NoKey', click: () => app.quit() },
       ])));
     }
+    await microphone.acquire().catch(() => {});
     await updateDevices();
     let lastMicrophone = JSON.stringify(microphone.snapshot());
     stateTimer = setInterval(() => {

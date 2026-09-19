@@ -16,8 +16,8 @@
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "org.voicedeck.mobile",
-      "buildNumber": "1",
+      "bundleIdentifier": "site.fishcloud.nokey",
+      "buildNumber": "2",
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "连接你已配对的 Mac，传送实时语音及快捷操作。",
         "NSCameraUsageDescription": "扫描 Mac 客户端上的配对二维码。",
@@ -27,8 +27,12 @@
         "NSMicrophoneUsageDescription": "将手机麦克风声音实时传送到你已配对的 Mac。",
         "UIBackgroundModes": [
           "audio"
+        ],
+        "NSBonjourServices": [
+          "_nokey._tcp"
         ]
-      }
+      },
+      "appleTeamId": "VMF4ZH3PR2"
     },
     "android": {
       "adaptiveIcon": {

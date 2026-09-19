@@ -43,6 +43,10 @@ test('production Mac connector and encrypted voice/keyboard APIs interoperate wi
   const connector = createRemoteRelay({ port: local.address().port, stateDir, accessToken: 'paired-token', localToken: 'local-only',
     relayOrigin: 'https://relay.example.cn', WebSocketImpl: LocalSocket,
     authenticate: token => token === 'paired-token', e2eeClients: clients,
+    probeEncryptedPairing: envelope => {
+      const payload = openE2EE(material, 'pair-probe', envelope);
+      return { envelope: sealE2EE(material, `pair-probe-response:${payload.requestId}`, { ok: true }) };
+    },
     handleAuthenticatedRequest: context => { clients.assertActive(context); return control.run(context.material.keyId, () => keyboard.handle(context) || handleVoiceRequest(context, { config: ice, offer(owner) {
       assert.equal(owner, material.keyId); offers++; return { sessionId: randomUUID() };
     } })); } });
@@ -52,6 +56,9 @@ test('production Mac connector and encrypted voice/keyboard APIs interoperate wi
   const post = (route, envelope) => fetch(base + route, { method: 'POST', body: JSON.stringify({ envelope }) });
   try {
     await ready;
+    const probeId = randomUUID();
+    const probe = await (await post('/api/e2ee/pair-probe', sealE2EE(material, 'pair-probe', { requestId: probeId }))).json();
+    assert.equal(openE2EE(material, `pair-probe-response:${probeId}`, probe.envelope).ok, true);
     const requestId = randomUUID();
     const sessionReply = await (await post('/api/e2ee/session', sealE2EE(material, 'session', {
       requestId, issuedAt: Date.now(), token: 'paired-token',

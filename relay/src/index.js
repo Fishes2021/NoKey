@@ -105,7 +105,7 @@ export function pairingPage(publicBase, code, nonce) {
 <title>语音快捷键盘配对</title><style nonce="${nonce}">body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1418;color:#e8eef2;font-family:system-ui,sans-serif;padding:24px;text-align:center}a{display:inline-block;margin-top:18px;padding:14px 22px;border-radius:12px;background:#2f6fed;color:#fff;text-decoration:none;font-weight:600}p{opacity:.75;line-height:1.45;max-width:28rem}</style></head>
 <body><div><h1>语音快捷键盘</h1><p>点击下方按钮，在已安装的手机 App 中继续配对，然后在 Mac 上确认。若未能打开，请回到 App 扫描 Mac 客户端中的二维码。</p><p>配对邀请限时有效，且只能使用一次。</p><p>尚未安装 App 时，请先向提供本开发版的维护者获取 iPhone 安装版本。</p><a id="open-microdex" href="${escapedLink}">打开语音快捷键盘</a></div><script nonce="${nonce}">
 const link=document.getElementById('open-microdex');const fragment=new URLSearchParams(location.hash.slice(1));
-if(fragment.get('e2ee')==='1'&&fragment.get('keyId')&&fragment.get('key')){const target=new URL(link.href);target.searchParams.set('e2ee','1');target.searchParams.set('keyId',fragment.get('keyId'));target.searchParams.set('key',fragment.get('key'));if(fragment.get('deviceName'))target.searchParams.set('deviceName',fragment.get('deviceName'));link.href=target.toString();}
+if(fragment.get('e2ee')==='1'&&fragment.get('keyId')&&fragment.get('key')){const target=new URL(link.href);target.searchParams.set('e2ee','1');target.searchParams.set('keyId',fragment.get('keyId'));target.searchParams.set('key',fragment.get('key'));if(fragment.get('routes'))target.searchParams.set('routes',fragment.get('routes'));if(fragment.get('deviceName'))target.searchParams.set('deviceName',fragment.get('deviceName'));link.href=target.toString();}
 </script></body></html>`;
 }
 

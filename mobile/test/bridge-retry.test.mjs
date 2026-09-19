@@ -55,3 +55,17 @@ test('expired action responses never replay writes; reads renew once and repeate
     resetEncryptedBridgeSession(url, material);
   }
 });
+
+test('foreground cancellation reaches fetch; offline errors retain a machine-readable reason', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    const controller = new AbortController();
+    globalThis.fetch = (_, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(new DOMException('Cancelled', 'AbortError')), { once: true });
+    });
+    const request = bridgeRequest('http://test.invalid', 'token', '/api/status', { signal: controller.signal });
+    controller.abort(); await assert.rejects(request);
+    globalThis.fetch = async () => Response.json({ code: 'MAC_OFFLINE' }, { status: 503 });
+    await assert.rejects(bridgeRequest('http://test.invalid', 'token', '/api/status'), error => error.code === 'MAC_OFFLINE');
+  } finally { globalThis.fetch = originalFetch; }
+});

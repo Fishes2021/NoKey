@@ -112,6 +112,7 @@ export function createRemoteRelay({
   authenticate = () => false,
   e2eeClients = null,
   claimEncryptedPairing = null,
+  probeEncryptedPairing = null,
   handleAuthenticatedRequest = null,
   allowLegacy = false,
   enabled = true,
@@ -291,6 +292,10 @@ export function createRemoteRelay({
       return;
     }
     try {
+      if (safePath === '/api/e2ee/pair-probe') {
+        if (!probeEncryptedPairing) throw new Error('配对探测不可用');
+        sendRequestResponse(message.requestId, 200, JSON.stringify(await probeEncryptedPairing(body.envelope))); return;
+      }
       if (safePath === '/api/e2ee/pair') {
         if (!claimEncryptedPairing) throw new Error('Encrypted pairing is unavailable.');
         const result = await claimEncryptedPairing(body.envelope);
@@ -348,7 +353,7 @@ export function createRemoteRelay({
       });
       return;
     }
-    if (safePath === '/api/e2ee' || safePath === '/api/e2ee/session' || safePath === '/api/e2ee/pair') {
+    if (safePath === '/api/e2ee' || safePath === '/api/e2ee/session' || safePath === '/api/e2ee/pair' || safePath === '/api/e2ee/pair-probe') {
       await answerEncryptedRelayRequest(message, safePath);
       return;
     }
@@ -447,7 +452,7 @@ export function createRemoteRelay({
         publish({
           status: 'error',
           ready: false,
-          error: error?.message || 'The stable relay connection failed.',
+          error: /Unexpected server response: (403|404)/.test(error?.message || '') ? '中继设备未登记或授权已到期，请在 Mac 连接设置中激活或检查授权；局域网仍可使用。' : error?.message || 'The stable relay connection failed.',
         });
       });
       socket.once('close', () => {

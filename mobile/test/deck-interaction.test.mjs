@@ -20,7 +20,7 @@ test('send ends dictation first, suppresses duplicate taps and never sends after
   for (const outcome of ['ok', 'failed', 'changed']) {
     const calls = []; let finish;
     const c = { keysReady: true, keysSaving: false, programmedKeys: [null,null,null,{ action: { type: 'shortcut', key: 'Enter', modifiers: [] } }],
-      sendInFlight: { current: false }, dictationActive: true, announce() {}, flashProgrammedKey() {}, LED: { complete: '', error: '' },
+      dictationSendDelay: { current: 350 }, sendInFlight: { current: false }, dictationActive: true, announce() {}, flashProgrammedKey() {}, LED: { complete: '', error: '' },
       keyboardNow: { current: { target: { id: 'editor' }, press: async () => { calls.push('send'); return true; } } },
       togglePhoneDictation: () => { calls.push('stop'); return new Promise(resolve => { finish = resolve; }); },
       setTimeout: callback => { calls.push('settle'); callback(); } };
@@ -84,11 +84,11 @@ test('joystick resolves taps and drags with a neutral centre and sends only conf
   }
   const calls = [], edits = [];
   const shortcut = { type: 'shortcut', key: 'F', modifiers: ['command'] };
-  const state = { keysReady: true, keysSaving: false, programmedKeys: Array(10).fill(null),
-    openKeyEditor: slot => edits.push(slot), genericKeyboard: { press: async (action, quiet) => calls.push([action, quiet]) } };
+  const state = { keysReady: true, keysSaving: false, keysDevice: 'phone', dictationActive: false, joystickSession: {current:null}, programmedKeys: Array(10).fill(null),
+    openKeyEditor: slot => edits.push(slot), genericKeyboard: { target:{id:'editor'}, press: async (action, quiet) => { calls.push([action, quiet]); return true; } } };
   state.programmedKeys[7] = { action: shortcut };
   vm.runInNewContext(extract('../app/index.tsx', 'handleJoystickDirection', true), state);
-  await state.run('right'); await state.run('up');
-  assert.deepEqual(calls, [[shortcut, true]]); assert.deepEqual(edits, [6]);
+  await state.run('right', false); await state.run('right', true); await state.run('up', false);
+  assert.deepEqual(calls, [[shortcut, true]]); assert.deepEqual(edits, []);
   state.keysReady = false; await state.run('right'); assert.equal(calls.length, 1);
 });

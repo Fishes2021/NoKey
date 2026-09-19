@@ -39,7 +39,7 @@ await writeFile(path.join(application, 'package.json'), JSON.stringify({
   license: 'GPL-3.0-only', dependencies: manifest.dependencies,
 }, null, 2));
 for (const relative of ['bridge/lib', 'bridge/server.mjs', 'bridge/hooks',
-  'desktop/assets/trayTemplate.png', 'desktop/assets/trayTemplate@2x.png', 'desktop/main.mjs', 'desktop/microphone-selection.mjs', 'desktop/login-item.mjs', 'desktop/launch.mjs', 'desktop/voice-host.mjs', 'desktop/ice-provider.mjs',
+  'desktop/assets/trayTemplate.png', 'desktop/assets/trayTemplate@2x.png', 'desktop/main.mjs', 'desktop/dictation-settings.mjs', 'desktop/subscription-client.mjs', 'desktop/microphone-selection.mjs', 'desktop/login-item.mjs', 'desktop/launch.mjs', 'desktop/voice-host.mjs', 'desktop/ice-provider.mjs',
   'mobile/lib/keyboard-shortcuts.mjs', 'mobile/lib/ice-config.mjs',
   'build/desktop/keyboard.node', 'build/desktop/voice-output.node']) {
   await copy(path.join(root, relative), path.join(application, relative));

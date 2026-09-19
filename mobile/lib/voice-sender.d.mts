@@ -1,7 +1,8 @@
 export type VoiceState = 'idle' | 'connecting' | 'speaking' | 'reconnecting' | 'error';
-export type VoiceTelemetry = { inputSelected?: boolean; inputError?: string; received: boolean | null; level: number | null; peak: number | null };
+export type VoiceTelemetry = { dictationManaged?: boolean; dictationLinked?: boolean; dictationError?: string; inputSelected?: boolean; inputError?: string; received: boolean | null; level: number | null; peak: number | null };
 export class VoiceSender {
   constructor(options: {
+    dictationLeaseId?: string;
     createPeer: (configuration: { iceServers: { urls: string | string[]; username?: string; credential?: string }[] }) => unknown;
     getIceConfig?: () => Promise<{ iceServers: { urls: string | string[]; username?: string; credential?: string }[]; expiresAt: number | null }>;
     stopCapture?: () => void;
@@ -17,5 +18,5 @@ export class VoiceSender {
   setGain(value: number): Promise<void>;
   restart(): Promise<void>;
   interrupt(message?: string): void;
-  stop(): Promise<void>;
+  stop(): Promise<{ dictationStopped?: boolean; dictationError?: string; sendDelayMs?: number } | undefined>;
 }

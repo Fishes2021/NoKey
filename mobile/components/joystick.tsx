@@ -1,7 +1,8 @@
-import { useCallback, useMemo, useRef } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { AppState, StyleSheet, Text, View } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+import { createHeldDirection } from '../lib/held-direction.mjs';
 
 type Direction = 'up' | 'right' | 'down' | 'left';
 export function joystickDirection(x: number, y: number, deadZone: number): Direction | null {
@@ -9,64 +10,52 @@ export function joystickDirection(x: number, y: number, deadZone: number): Direc
   if (Math.hypot(x, y) <= deadZone) return null;
   return Math.abs(x) > Math.abs(y) ? x > 0 ? 'right' : 'left' : y > 0 ? 'down' : 'up';
 }
-
-export function Joystick({ onDirection, onConfigure, labels }: {
-  onDirection: (direction: Direction) => void;
-  onConfigure: (direction: Direction) => void;
+export function Joystick({ onDirection, labels, enabled = true, resetKey = '' }: {
+  onDirection: (direction: Direction, repeat: boolean) => Promise<boolean>;
   labels: Partial<Record<Direction, string>>;
+  enabled?: boolean; resetKey?: string;
 }) {
-  const handlers = useRef({ onDirection, onConfigure });
-  handlers.current = { onDirection, onConfigure };
-  const commit = useCallback((direction: Direction) => handlers.current.onDirection(direction), []);
-  const configure = useCallback((direction: Direction) => handlers.current.onConfigure(direction), []);
-  const x = useSharedValue(0), y = useSharedValue(0);
+  const handlers = useRef({ onDirection, enabled }); handlers.current = { onDirection, enabled };
+  const repeater = useMemo(() => createHeldDirection((direction, repeat) => handlers.current.enabled && AppState.currentState === 'active'
+    ? handlers.current.onDirection(direction as Direction, repeat) : Promise.resolve(false)), []);
+  const x = useSharedValue(0), y = useSharedValue(0), held = useSharedValue<Direction | null>(null);
   const width = useSharedValue(100), height = useSharedValue(100);
+  useEffect(() => {
+    repeater.stop(); held.value = null; x.value = 0; y.value = 0;
+    const subscription = AppState.addEventListener('change', state => { if (state !== 'active') { repeater.stop(); held.value = null; x.value = 0; y.value = 0; } });
+    return () => { repeater.stop(); subscription.remove(); };
+  }, [repeater, enabled, resetKey, held, x, y]);
+  const change = useCallback((direction: Direction | null) => repeater.set(direction), [repeater]);
   const capStyle = useAnimatedStyle(() => ({ transform: [{ translateX: x.value }, { translateY: y.value }] }));
   const gesture = useMemo(() => {
-    const pan = Gesture.Pan().minDistance(6).maxPointers(1).shouldCancelWhenOutside(false)
-      .onUpdate(event => {
-        const limit = Math.min(width.value, height.value) * 0.15;
-        const distance = Math.hypot(event.translationX, event.translationY);
-        const scale = distance > limit ? limit / distance : 1;
-        x.value = event.translationX * scale; y.value = event.translationY * scale;
-      })
-      .onEnd(event => {
-        const direction = joystickDirection(event.translationX, event.translationY, 6);
-        if (direction) runOnJS(commit)(direction);
-      })
+    const update = (px: number, py: number) => {
+      'worklet';
+      const dx = px - width.value / 2, dy = py - height.value / 2;
+      const limit = Math.min(width.value, height.value) * 0.15;
+      const distance = Math.hypot(dx, dy), scale = distance > limit ? limit / distance : 1;
+      x.value = dx * scale; y.value = dy * scale;
+      const direction = joystickDirection(dx, dy, Math.min(width.value, height.value) * 0.18);
+      if (direction !== held.value) { held.value = direction; runOnJS(change)(direction); }
+    };
+    return Gesture.Pan().enabled(enabled).minDistance(0).maxPointers(1).shouldCancelWhenOutside(false)
+      .onStart(event => { update(event.x, event.y); })
+      .onUpdate(event => { update(event.x, event.y); })
       .onFinalize(() => {
-        x.value = withSpring(0, { damping: 16, stiffness: 250 });
-        y.value = withSpring(0, { damping: 16, stiffness: 250 });
+        held.value = null; runOnJS(change)(null);
+        x.value = withSpring(0, { damping: 16, stiffness: 250 }); y.value = withSpring(0, { damping: 16, stiffness: 250 });
       });
-    const tap = Gesture.Tap().maxDistance(6).onEnd((event, success) => {
-      if (!success) return;
-      const direction = joystickDirection(event.x - width.value / 2, event.y - height.value / 2, Math.min(width.value, height.value) * 0.18);
-      if (direction) runOnJS(commit)(direction);
-    });
-    const hold = Gesture.LongPress().minDuration(500).maxDistance(6).onStart(event => {
-      const direction = joystickDirection(event.x - width.value / 2, event.y - height.value / 2, 0) || 'up';
-      runOnJS(configure)(direction);
-    });
-    return Gesture.Race(pan, Gesture.Exclusive(hold, tap));
-  }, [commit, configure, width, height, x, y]);
+  }, [enabled, change, held, width, height, x, y]);
   return <GestureDetector gesture={gesture}>
     <View collapsable={false} style={styles.module}
       onLayout={event => { width.value = event.nativeEvent.layout.width; height.value = event.nativeEvent.layout.height; }}
-      accessible accessibilityRole="adjustable" accessibilityLabel="四向自定义摇杆"
-      accessibilityHint="点按边缘或向对应方向拖动后松手执行；长按配置快捷键。"
-      accessibilityActions={[
-        ...(['up', 'right', 'down', 'left'] as const).map((direction, index) => ({ name: direction, label: `${['上', '右', '下', '左'][index]}：${labels[direction] || '未设置'}` })),
-        { name: 'configure', label: '设置摇杆快捷键' },
-      ]}
-      onAccessibilityAction={event => {
-        const action = event.nativeEvent.actionName;
-        if (action === 'configure') configure('up');
-        else if (['up', 'right', 'down', 'left'].includes(action)) commit(action as Direction);
-      }}>
+      accessible accessibilityRole="adjustable" accessibilityLabel="四向光标摇杆" accessibilityState={{ disabled: !enabled }}
+      accessibilityHint="点按移动一次，按住方向连续移动，松手停止。自定义请进入设置。"
+      accessibilityActions={(['up', 'right', 'down', 'left'] as const).map((direction, index) => ({ name: direction, label: `${['上', '右', '下', '左'][index]}：${labels[direction] || '移动光标'}` }))}
+      onAccessibilityAction={event => { if (enabled && ['up', 'right', 'down', 'left'].includes(event.nativeEvent.actionName)) void onDirection(event.nativeEvent.actionName as Direction, false); }}>
       <View pointerEvents="none" style={styles.socket} />
       <Animated.View pointerEvents="none" style={[styles.cap, capStyle]}><View style={styles.thumb} /></Animated.View>
-      {(['up', 'right', 'down', 'left'] as const).map(direction => <Text pointerEvents="none" key={direction}
-        numberOfLines={1} style={[styles.label, styles[direction]]}>{labels[direction] || (direction === 'up' || direction === 'down' ? '│' : '─')}</Text>)}
+      {(['up', 'right', 'down', 'left'] as const).map((direction, index) => <Text pointerEvents="none" key={direction}
+        numberOfLines={1} style={[styles.label, styles[direction]]}>{labels[direction] || ['上', '右', '下', '左'][index]}</Text>)}
     </View>
   </GestureDetector>;
 }

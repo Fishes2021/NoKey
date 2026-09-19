@@ -33,10 +33,20 @@ static bool prepareKeys(KeyEvents *list, CGKeyCode key, CGEventFlags flags) {
     CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStatePrivate);
     if (!source) return false;
     bool ok = true;
-    if (key == kVK_RightOption) {
-        // Modifier-only shortcuts need flagsChanged with the right-side device bit.
+    CGEventFlags singleFlag = 0;
+    switch (key) {
+        case kVK_Option: singleFlag = kCGEventFlagMaskAlternate | NX_DEVICELALTKEYMASK; break;
+        case kVK_RightOption: singleFlag = kCGEventFlagMaskAlternate | NX_DEVICERALTKEYMASK; break;
+        case kVK_Control: singleFlag = kCGEventFlagMaskControl | NX_DEVICELCTLKEYMASK; break;
+        case kVK_RightControl: singleFlag = kCGEventFlagMaskControl | NX_DEVICERCTLKEYMASK; break;
+        case kVK_Shift: singleFlag = kCGEventFlagMaskShift | NX_DEVICELSHIFTKEYMASK; break;
+        case kVK_RightShift: singleFlag = kCGEventFlagMaskShift | NX_DEVICERSHIFTKEYMASK; break;
+        case kVK_Command: singleFlag = kCGEventFlagMaskCommand | NX_DEVICELCMDKEYMASK; break;
+        case kVK_RightCommand: singleFlag = kCGEventFlagMaskCommand | NX_DEVICERCMDKEYMASK; break;
+    }
+    if (singleFlag) {
         if (flags != 0) { CFRelease(source); return false; }
-        ok = appendEvent(list, source, key, true, kCGEventFlagMaskAlternate | NX_DEVICERALTKEYMASK);
+        ok = appendEvent(list, source, key, true, singleFlag);
         if (ok) CGEventSetType(list->events[list->count - 1], kCGEventFlagsChanged);
         if (ok) ok = appendEvent(list, source, key, false, 0);
         if (ok) CGEventSetType(list->events[list->count - 1], kCGEventFlagsChanged);
@@ -114,6 +124,15 @@ int main(void) {
         assert(CGEventGetFlags(option.events[0]) & NX_DEVICERALTKEYMASK);
         assert(CGEventGetFlags(option.events[1]) == 0);
         clearEvents(&option);
+        CGKeyCode singles[] = { kVK_Option, kVK_RightOption, kVK_Control, kVK_RightControl, kVK_Shift, kVK_RightShift, kVK_Command, kVK_RightCommand };
+        for (size_t i = 0; i < sizeof(singles) / sizeof(singles[0]); ++i) {
+            KeyEvents single = {0};
+            assert(prepareKeys(&single, singles[i], 0));
+            assert(single.count == 2 && CGEventGetType(single.events[0]) == kCGEventFlagsChanged);
+            assert(CGEventGetFlags(single.events[0]) != 0 && CGEventGetFlags(single.events[1]) == 0);
+            clearEvents(&single);
+            assert(!prepareKeys(&single, singles[i], kCGEventFlagMaskCommand));
+        }
         NSString *sample = @"1234567890123456789😀中文";
         assert(prepareText(&unicode, sample));
         NSMutableString *restored = [NSMutableString string];
@@ -200,12 +219,26 @@ static napi_value press(napi_env env, napi_callback_info info) {
             @"targetChangedDuringPost": @(![currentTarget()[@"id"] isEqualToString:expected]) });
     }
 }
+static NSNetService *discoveryService;
+static napi_value advertise(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value args[1], result; int32_t port = 0;
+    if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc != 1 ||
+        napi_get_value_int32(env, args[0], &port) != napi_ok || port < 0 || port > 65535)
+        return fail(env, "INVALID", "发现服务端口无效");
+    [discoveryService stop]; discoveryService = nil;
+    if (port) {
+        discoveryService = [[NSNetService alloc] initWithDomain:@"local." type:@"_nokey._tcp." name:@"NoKey" port:port];
+        [discoveryService publish];
+    }
+    napi_get_undefined(env, &result); return result;
+}
 NAPI_MODULE_INIT() {
-    napi_value read, send;
+    napi_value read, send, discovery;
     if (napi_create_function(env, "snapshot", NAPI_AUTO_LENGTH, snapshot, NULL, &read) != napi_ok ||
         napi_set_named_property(env, exports, "snapshot", read) != napi_ok ||
         napi_create_function(env, "press", NAPI_AUTO_LENGTH, press, NULL, &send) != napi_ok ||
         napi_set_named_property(env, exports, "press", send) != napi_ok) return fail(env, "NATIVE", "无法加载按键模块");
+    if (napi_create_function(env, "advertise", NAPI_AUTO_LENGTH, advertise, NULL, &discovery) != napi_ok || napi_set_named_property(env, exports, "advertise", discovery) != napi_ok) return fail(env, "NATIVE", "无法加载本机发现");
     return exports;
 }
 #endif

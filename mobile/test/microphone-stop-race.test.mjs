@@ -14,7 +14,7 @@ test('late stop success or failure cannot overwrite the next microphone session'
   for (const [fail, restart] of [[false, true], [true, true], [false, false], [true, false]]) {
     // Minimal hook storage; run the real hook, replacing only React scheduling,
     // storage and media dependencies. No native capture or network requests.
-    const slots = []; let cursor = 0, settle;
+    const slots = []; let cursor = 0, settle, onAppState;
     const react = {
       useState(initial) {
         const index = cursor++;
@@ -34,7 +34,7 @@ test('late stop success or failure cannot overwrite the next microphone session'
       }
     }
     const modules = {
-      react, 'react-native': { Platform: { OS: 'ios' } },
+      react, 'react-native': { Platform: { OS: 'ios' }, AppState: { currentState: 'active', addEventListener(_, fn) { onAppState = fn; return { remove() {} }; } } },
       '../lib/voice-sender.mjs': { VoiceSender: Sender },
       '../lib/phone-audio-capture.mjs': { createPhoneAudioCapture: () => ({ stop() {}, getStream() {} }) },
       '../lib/ice-config.mjs': { validateIceConfig: value => value },
@@ -43,20 +43,22 @@ test('late stop success or failure cannot overwrite the next microphone session'
       'react-native-webrtc': {}, '../modules/voicedeck-audio': { default: {} },
     };
     const exports = {};
-    vm.runInNewContext(compiled, { exports, Error, require(name) { assert(name in modules, name); return modules[name]; } });
+    vm.runInNewContext(compiled, { exports, Error, AbortController, require(name) { assert(name in modules, name); return modules[name]; } });
     const material = { keyId: 'test-key', key: 'unused' };
     const render = () => { cursor = 0; return exports.usePhoneMicrophone('http://test.invalid', 'token', material); };
     render(); await setImmediate();
     await render().toggle();
     assert.equal(render().state, 'speaking');
-    const stopping = render().toggle();
+    const background = !fail && !restart;
+    if (background) { modules['react-native'].AppState.currentState = 'background'; onAppState('background'); }
+    const stopping = background ? Promise.resolve() : render().toggle();
     assert.equal(render().state, 'idle');
     assert.equal(render().message, '手机麦克风已停止，正在确认 Mac 恢复');
     if (restart) {
       await render().toggle();
       assert.equal(render().state, 'speaking');
     }
-    settle(); await stopping;
+    settle(); await stopping; await setImmediate();
     assert.equal(render().state, restart ? 'speaking' : 'idle');
     assert.equal(render().message, restart ? '手机麦克风传输中' : fail ? 'late failure' : '手机麦克风已停止');
   }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Shared by the React Native adapter and the real browser transport check.
 export class VoiceSender {
-  constructor({ createPeer, getStream, stopCapture = () => {}, request, onState = () => {}, onStats = () => {}, iceServers = [], gain = 1, getIceConfig = async () => ({ iceServers, expiresAt: null }) }) {
-    Object.assign(this, { createPeer, getStream, stopCapture, request, onState, onStats, iceServers, getIceConfig });
+  constructor({ dictationLeaseId, createPeer, getStream, stopCapture = () => {}, request, onState = () => {}, onStats = () => {}, iceServers = [], gain = 1, getIceConfig = async () => ({ iceServers, expiresAt: null }) }) {
+    Object.assign(this, { dictationLeaseId, createPeer, getStream, stopCapture, request, onState, onStats, iceServers, getIceConfig });
     if (!Number.isFinite(gain) || gain < 0 || gain > 4) throw new Error('音量范围为 0–4');
     this.gain = gain;
     this.gainPending = false;
@@ -75,11 +75,12 @@ export class VoiceSender {
       });
       if (this.current !== s) return;
       const answer = await this.request(restart ? '/api/voice/restart' : '/api/voice/offer', {
-        ...(restart ? { sessionId: s.id } : {}),
+        ...(restart ? { sessionId: s.id } : this.dictationLeaseId ? { dictationLeaseId: this.dictationLeaseId } : {}),
         description: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
       });
       if (restart && answer.sessionId !== s.id) throw new Error('续期返回了不同的语音会话');
       s.id = answer.sessionId;
+      if (!restart) s.dictationManaged = answer.dictationManaged === true;
       if (this.current !== s) { await this.request('/api/voice/stop', { sessionId: s.id }); return; }
       // Apply the saved gain before allowing the new media connection to start.
       if (!restart && this.gain !== 1) await this.setGain(this.gain);
@@ -166,7 +167,7 @@ export class VoiceSender {
               level = Math.max(0, Math.min(1, report.audioLevel));
           });
         } catch { /* Level is optional; unknown must not look like zero input. */ }
-        if (this.current === s) this.onStats({ received, level, inputSelected: status.inputSelected === true, inputError: typeof status.inputError === 'string' ? status.inputError : '', peak: received && Number.isFinite(status.peak) && status.peak >= 0 ? status.peak : null });
+        if (this.current === s) this.onStats({ received, level, ...(s.dictationManaged ? { dictationManaged: true, dictationLinked: status.dictationLinked === true, dictationError: status.dictationError || '' } : {}), inputSelected: status.inputSelected === true, inputError: typeof status.inputError === 'string' ? status.inputError : '', peak: received && Number.isFinite(status.peak) && status.peak >= 0 ? status.peak : null });
       } catch (error) {
         if (this.current !== s) return;
         this.onStats({ received: null, level: null, peak: null });
@@ -202,7 +203,8 @@ export class VoiceSender {
     try {
       if (s.id) {
         const reply = await this.request('/api/voice/stop', { sessionId: s.id });
-        if (reply?.microphone?.recovery) throw new Error(reply.microphone.message || '原麦克风尚未恢复，请在 Mac 点击恢复');
+        if (reply?.microphone?.recovery && reply?.microphoneHeld !== true) throw new Error(reply.microphone.message || '原麦克风尚未恢复，请在 Mac 点击恢复');
+        return reply;
       }
     }
     finally { if (captureError) throw captureError; }

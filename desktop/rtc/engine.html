@@ -4,7 +4,7 @@
 <main><header><h1>NoKey</h1><button id="settings-toggle" type="button" aria-expanded="false">设置</button></header>
 <p id="error" role="alert"></p><p id="audio-error" role="alert"></p><p id="microphone-message" role="status"></p>
 <div id="overview"><section class="connection-card"><p id="summary-phone">等待手机连接</p><p id="summary-network">正在启动…</p></section>
-<section class="overview-audio"><h2 id="summary-audio">麦克风待机</h2><p id="summary-input"></p><p>讲话时自动切换，结束后恢复</p></section>
+<section class="overview-audio"><h2 id="summary-audio">麦克风待机</h2><p id="summary-input"></p><p>NoKey 运行时使用虚拟麦克风，退出后恢复</p></section>
 <div class="status-row"><span>快捷控制</span><span id="summary-keyboard"></span></div>
 <div class="actions"><button id="pair-open" type="button">配对手机</button><button id="restore-quick" type="button">恢复麦克风</button></div>
 </div><div id="settings" hidden><p id="device-name"></p>
@@ -22,7 +22,7 @@
 <button id="device-check" type="button">重新检查麦克风</button>
 <div id="device-install-help"><p>首次使用需要安装完整的 Mac 配套安装包，单独打开客户端不会安装虚拟麦克风。</p>
 <ol><li>保存工作并退出本客户端，运行本产品的 Mac 安装包。</li><li>按安装向导完成系统授权并重启 Mac，然后重新打开客户端。</li><li>点击“重新检查麦克风”。若仍未发现设备，保留下面的诊断码并反馈，不需要另外安装 BlackHole。</li></ol></div>
-<p id="device-select-help" hidden>手机开始讲话后自动切换系统麦克风，结束后恢复；打开客户端不会切换。</p>
+<p id="device-select-help" hidden>打开 NoKey 时切换到虚拟麦克风，退出 NoKey 后恢复原麦克风；停止讲话不切换音源。</p>
 <p>目标应用请设为跟随系统默认输入；独立固定音源的应用不会随系统切换。</p>
 <p id="microphone-current" role="status"></p>
 <button id="microphone-restore" type="button">恢复原麦克风</button>
@@ -34,14 +34,25 @@
 <button id="keyboard" type="button">启用通用快捷键</button>
 <button id="keyboard-permission" type="button">设置辅助功能权限</button><button id="keyboard-check" type="button">检查权限</button><p id="keyboard-status" role="status"></p>
 </section>
+<section aria-labelledby="dictation-title"><h2 id="dictation-title">语音快捷键</h2>
+<p>选择输入法已有的快捷键，按一次开始、再按一次结束。此处不会更改输入法设置，不支持双击、长按或 Fn／地球键。</p>
+<form id="dictation-form"><label for="dictation-key">单键或组合键的主键</label><select id="dictation-key"></select>
+<fieldset id="dictation-modifiers"><legend>组合键修饰键（单键无需勾选）</legend></fieldset>
+<details><summary>结束后发送延迟</summary><label for="dictation-delay">等待最后文字上屏（毫秒，默认 350）</label><input id="dictation-delay" type="number" min="0" max="3000" step="50" value="350"></details>
+<button type="submit">保存语音设置</button><p id="dictation-status" role="status"></p></form>
+<p>测试：保存后将 Mac 光标放入输入框，用手机“讲话”开始、结束各一次；确认正常后再试“结束并发送”。手动操作输入法可能使听写状态不一致。</p></section>
 <section aria-labelledby="connection-title"><h2 id="connection-title">连接服务设置</h2>
 <p id="connection-config-error" role="alert"></p><p id="connection-backup"></p>
 <form id="connection-form"><label for="relay-origin">国内服务地址</label>
 <input id="relay-origin" type="url" maxlength="2048" placeholder="https://你的服务域名" autocomplete="off" spellcheck="false" aria-describedby="connection-help">
 <p id="connection-help">填写本产品配套服务的 HTTPS 根地址；留空仅使用局域网。服务需由运营方部署在国内，普通网站地址不能用于连接。</p>
-<button id="connection-save" type="submit">保存连接设置</button></form><p id="connection-status" role="status"></p></section>
+<button id="connection-save" type="submit">保存连接设置</button></form><p id="connection-status" role="status"></p>
+<div><h3>中继服务授权</h3><p>局域网免费，无需激活。月付或年付中继授权绑定这台 Mac，到期后局域网仍可使用。</p>
+<label for="subscription-code">激活码或续费码</label><input id="subscription-code" type="password" maxlength="35" autocomplete="off" spellcheck="false" placeholder="NK-…">
+<button id="subscription-activate" type="button">激活 / 续期</button><button id="subscription-check" type="button">检查授权</button>
+<p id="subscription-status" role="status">尚未检查中继授权</p></div></section>
 <section aria-labelledby="login-title"><h2 id="login-title">登录时启动</h2>
-<p>开启后，每次登录这台 Mac 会打开“NoKey”客户端，并等待已配对手机连接，直到你主动退出 NoKey。它使用本产品的配对配置和网络连接；不会自动开麦或启用快捷控制。</p>
+<p>开启后，每次登录这台 Mac 会打开“NoKey”客户端，并等待已配对手机连接，直到你主动退出 NoKey。它使用本产品的配对配置和网络连接；会切换到虚拟麦克风，但不会自动开启手机采音或启用快捷控制。</p>
 <button id="login-enable" type="button" disabled>开启登录启动</button><button id="login-disable" type="button" disabled>关闭登录启动</button><button id="login-check" type="button">刷新启动状态</button>
 <p id="login-status" role="status"></p><p>也可在系统设置的“登录项”中关闭“NoKey”。关闭此选项不停止当前客户端，选择“退出 NoKey”可停止本次服务。</p></section>
 <section aria-labelledby="manage-title"><h2 id="manage-title">管理客户端</h2><p>立即停止本次语音和连接服务，保留配对与设置。若已开启登录启动，下次登录仍会打开客户端；可在上方单独关闭登录启动。</p><button id="uninstall" type="button" disabled>卸载NoKey</button><p>卸载仅移除本产品；个人配对配置保留。</p></section>

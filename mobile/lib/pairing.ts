@@ -1,3 +1,4 @@
+import { ConnectionRoutes } from './connection-routes.mjs';
 import {
   type E2EEEnvelope,
   type E2EEKeyMaterial,
@@ -7,18 +8,26 @@ import {
 
 export type PairingCredentials = {
   bridgeUrl: string;
+  routes?: string[];
   token: string;
   e2ee?: E2EEKeyMaterial;
 };
 
 export type PairingPayload = {
   bridgeUrl: string;
+  routes?: string[];
   deviceName?: string;
   token?: string;
   code?: string;
   e2ee?: E2EEKeyMaterial;
 };
 
+function readRoutes(params: URLSearchParams): string[] | undefined {
+  const raw = params.get('routes'); if (!raw) return undefined;
+  const addresses = JSON.parse(raw);
+  if (!Array.isArray(addresses) || addresses.length > 12) throw new Error('配对地址列表无效');
+  return [...new Set(addresses.map(value => normalizeBridgeUrl(String(value))))];
+}
 function readDeviceName(params: URLSearchParams) {
   return params.get('deviceName')?.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 80);
 }
@@ -121,6 +130,7 @@ export function parsePairingUrl(value: string): PairingPayload {
     }
     const params = new URLSearchParams(parsed.hash.slice(1));
     const deviceName = readDeviceName(params);
+    const routes = readRoutes(params);
     const e2ee = readE2EEPairing(params);
     return {
       bridgeUrl: normalizeBridgeUrl(
@@ -128,6 +138,7 @@ export function parsePairingUrl(value: string): PairingPayload {
       ),
       ...(code ? { code } : { token }),
       ...(deviceName ? { deviceName } : {}),
+      ...(routes ? { routes } : {}),
       ...(e2ee ? { e2ee } : {}),
     };
   }
@@ -141,11 +152,13 @@ export function parsePairingUrl(value: string): PairingPayload {
       throw new Error('The pairing QR code is incomplete.');
     }
     const deviceName = readDeviceName(parsed.searchParams);
+    const routes = readRoutes(parsed.searchParams);
     const e2ee = readE2EEPairing(parsed.searchParams);
     return {
       bridgeUrl: normalizeBridgeUrl(rawBridgeUrl),
       ...(code ? { code } : { token }),
       ...(deviceName ? { deviceName } : {}),
+      ...(routes ? { routes } : {}),
       ...(e2ee ? { e2ee } : {}),
     };
   }
@@ -175,6 +188,21 @@ export async function claimPairingPayload(payload: PairingPayload, signal?: Abor
     };
   }
   if (!payload.code) throw new Error('The pairing QR code is incomplete.');
+  if (payload.routes?.length && payload.e2ee) {
+    const crypto = await import('./e2ee.ts');
+    const selector = new ConnectionRoutes(payload.routes, async (address, probeSignal) => {
+      const requestId = await crypto.randomE2EEId();
+      const envelope = await crypto.sealMobileE2EE(payload.e2ee!, 'pair-probe', { requestId, issuedAt: Date.now(), code: payload.code });
+      const response = await fetch(`${address}/api/e2ee/pair-probe`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ envelope }), signal: probeSignal });
+      const result = await response.json();
+      if (!response.ok || !openE2EE<{ ok: boolean }>(payload.e2ee!, `pair-probe-response:${requestId}`, result.envelope).ok) throw new Error('目标 Mac 未通过身份验证');
+    });
+    const cancelSelection = () => selector.reset(false);
+    signal?.addEventListener('abort', cancelSelection, { once: true });
+    try { payload = { ...payload, bridgeUrl: await selector.select(signal) }; }
+    finally { signal?.removeEventListener('abort', cancelSelection); }
+  }
+
 
   const controller = new AbortController();
   const cancel = () => controller.abort();
@@ -238,6 +266,7 @@ export async function claimPairingPayload(payload: PairingPayload, signal?: Abor
     }
     return {
       bridgeUrl: normalizeBridgeUrl(payload.bridgeUrl),
+      ...(payload.routes ? { routes: payload.routes } : {}),
       token: result.token,
       ...(payload.e2ee ? { e2ee: payload.e2ee } : {}),
     };

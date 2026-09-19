@@ -7,16 +7,24 @@ import path from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { parseDeviceRoute, pairingPage, responseTimeout } from './index.js';
 import { normalizeRelayOrigin } from '../../bridge/lib/remote-relay.mjs';
+import { openSubscriptions } from './subscriptions.mjs';
+import { closeExpiredTurnSessions } from './turn-admin.mjs';
 import { issueTurnCredentials } from './turn-credentials.mjs';
 
-export async function startRelay({ publicOrigin, devices, turn, host = '127.0.0.1', port = 8787 }) {
+export async function startRelay({ publicOrigin, devices = {}, turn, subscriptions, host = '127.0.0.1', port = 8787 }) {
   publicOrigin = normalizeRelayOrigin(publicOrigin);
   // Small private pilot: operator provisions device hashes; public enrolment is a separate release requirement.
   if (!devices || Object.keys(devices).length > 100 || Object.entries(devices).some(([id, digest]) =>
     !/^[A-Za-z0-9_-]{20,64}$/.test(id) || typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest)))
     throw new Error('设备登记配置无效');
   if (turn) issueTurnCredentials({ ...turn, deviceId: 'configuration_validation' });
+  const store = subscriptions ? openSubscriptions(subscriptions.database) : null;
+  if (store && turn && !subscriptions.turnAdmin) { store.close(); throw new Error('付费中继必须配置TURN本机到期断开接口'); }
+  const entitlement = id => devices[id] ? { status: 'active', expiresAt: null } : store?.status(id) || { status: 'inactive', expiresAt: null };
+  const allowed = id => entitlement(id).status === 'active';
   const rooms = new Map(Object.keys(devices).map(id => [id, { mac: null, phones: new Map(), pending: new Map(), requests: 0 }]));
+  for (const id of store?.ids() || []) if (!rooms.has(id)) rooms.set(id, { mac: null, phones: new Map(), pending: new Map(), requests: 0 });
+  let turnCheckedAt = 0, sweeping = false;
   const metrics = { requests: 0, forwardedBytes: 0, rejected: 0, iceIssued: 0 };
   const actors = new Map();
   const sockets = new WebSocketServer({ noServer: true, maxPayload: 400000, perMessageDeflate: false });
@@ -30,7 +38,8 @@ export async function startRelay({ publicOrigin, devices, turn, host = '127.0.0.
   };
   const authenticateMac = (request, id) => {
     const secret = request.headers['x-microdex-device-secret'];
-    if (!devices[id] || typeof secret !== 'string' || secret.length < 32 || secret.length > 256) return false;
+    if (!devices[id]) return store?.authenticate(id, secret) === true;
+    if (typeof secret !== 'string' || secret.length < 32 || secret.length > 256) return false;
     const digest = createHash('sha256').update(secret).digest();
     return timingSafeEqual(digest, Buffer.from(devices[id], 'hex'));
   };
@@ -72,10 +81,30 @@ export async function startRelay({ publicOrigin, devices, turn, host = '127.0.0.
       if (limited(request, room)) { metrics.rejected++; return reply(response, 429, { error: '请求过于频繁' }); }
       if (url.pathname === '/health') return reply(response, 200, { ok: true, protocolVersion: 2, endToEndEncryption: true });
       if (request.method === 'OPTIONS') return reply(response, 204, {});
-      if (!room) return reply(response, 404, { error: '设备未登记' });
+      if (url.pathname === '/v1/activate' && request.method === 'POST' && store) {
+        const chunks = []; let bytes = 0;
+        for await (const chunk of request) {
+          bytes += chunk.length;
+          if (bytes > 2048) return reply(response, 413, { error: '激活信息过大' });
+          chunks.push(chunk);
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString());
+        try {
+          const result = store.redeem(body);
+          if (!rooms.has(body.deviceId)) rooms.set(body.deviceId, { mac: null, phones: new Map(), pending: new Map(), requests: 0 });
+          return reply(response, 200, result);
+        } catch (error) { return reply(response, 400, { error: error.message }); }
+      }
+      if (route?.roomPath === '/subscription' && request.method === 'POST') {
+        if (!authenticateMac(request, route.deviceId)) return reply(response, 401, { error: '设备尚未激活或身份无效' });
+        return reply(response, 200, entitlement(route.deviceId));
+      }
+      if (!room) return reply(response, 404, { error: '设备未登记', code: 'RELAY_INACTIVE' });
+      if (!allowed(route.deviceId)) return reply(response, 403, { error: '中继授权未开通、已到期或已停用；局域网仍可使用', code: 'RELAY_SUBSCRIPTION_REQUIRED' });
       if (route.roomPath === '/ice' && request.method === 'POST') {
         if (!authenticateMac(request, route.deviceId)) return reply(response, 401, { error: '设备认证失败' });
         if (!turn) return reply(response, 503, { error: '媒体中继尚未配置' });
+        if (store && !devices[route.deviceId] && Date.now() - turnCheckedAt > 15000) return reply(response, 503, { error: '音频中继授权检查暂不可用' });
         metrics.iceIssued++;
         return reply(response, 200, issueTurnCredentials({ ...turn, deviceId: route.deviceId }));
       }
@@ -87,7 +116,7 @@ export async function startRelay({ publicOrigin, devices, turn, host = '127.0.0.
           'Content-Security-Policy': `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'` });
         return response.end(pairingPage(`${publicOrigin}${route.basePath}`, code, nonce).replaceAll('microdex:///', 'voicedeck:///'));
       }
-      if (request.method !== 'POST' || !['/api/e2ee/pair', '/api/e2ee/session', '/api/e2ee'].includes(route.roomPath) || url.search)
+      if (request.method !== 'POST' || !['/api/e2ee/pair-probe', '/api/e2ee/pair', '/api/e2ee/session', '/api/e2ee'].includes(route.roomPath) || url.search)
         return reply(response, 404, { error: '仅支持加密客户端接口' });
       if (room.mac?.readyState !== WebSocket.OPEN) return reply(response, 503, { error: 'Mac 未在线', code: 'MAC_OFFLINE' });
       if (room.pending.size >= 32 || globalPending >= 128) return reply(response, 429, { error: '请求队列已满' });
@@ -118,6 +147,7 @@ export async function startRelay({ publicOrigin, devices, turn, host = '127.0.0.
     const reject = status => { metrics.rejected++; socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); };
     if (limited(request, room)) return reject('429 Too Many Requests');
     if (!room) return reject('404 Not Found');
+    if (!allowed(route.deviceId)) return reject('403 Forbidden');
     const mac = route.roomPath === '/connect';
     if (!mac && !['/events', '/api/remote/events'].includes(route.roomPath)) return reject('404 Not Found');
     if (mac && !authenticateMac(request, route.deviceId)) return reject('401 Unauthorized');
@@ -140,6 +170,7 @@ export async function startRelay({ publicOrigin, devices, turn, host = '127.0.0.
         else { room.phones.delete(phoneId); send(room.mac, { type: 'phone-disconnected', phoneId }); }
       });
       ws.on('message', (raw, binary) => {
+        if (!allowed(route.deviceId)) { ws.close(1008, 'Relay subscription expired'); return; }
         if (++messages > (mac ? 3600 : 60) || binary) { ws.terminate(); return; }
         let message;
         try { message = JSON.parse(raw.toString()); if (!message || typeof message !== 'object') throw new Error(); }
@@ -172,15 +203,29 @@ export async function startRelay({ publicOrigin, devices, turn, host = '127.0.0.
       ws.clearAuthTimeout = () => { clearTimeout(authTimer); authTimer = null; };
     });
   });
+  const sweep = async () => {
+    if (sweeping) return;
+    sweeping = true;
+    try {
+      for (const [id, room] of rooms) if (!allowed(id)) {
+        if (room.mac) { const socket = room.mac; disconnectMac(room, socket); socket.close(1008, 'Relay subscription expired'); }
+      }
+      if (subscriptions?.turnAdmin) { await closeExpiredTurnSessions(subscriptions.turnAdmin, allowed); turnCheckedAt = Date.now(); }
+    } catch { turnCheckedAt = 0; /* Refuse new paid TURN credentials until management recovers. */ }
+    finally { sweeping = false; }
+  };
+  await sweep();
+  const subscriptionTimer = store ? setInterval(() => void sweep(), 5000) : null;
   const heartbeat = setInterval(() => {
     for (const ws of sockets.clients) { if (!ws.alive) ws.terminate(); else { ws.alive = false; ws.ping(); } }
   }, 20000);
   const resetRates = setInterval(() => { actors.clear(); for (const room of rooms.values()) room.requests = 0; }, 60000);
   const close = () => stopping ??= Promise.resolve().then(async () => {
-    clearInterval(heartbeat); clearInterval(resetRates);
+    clearInterval(heartbeat); clearInterval(resetRates); clearInterval(subscriptionTimer);
     for (const ws of sockets.clients) ws.terminate();
     sockets.close();
     await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
+    store?.close();
   });
   try { await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, resolve); }); }
   catch (error) { await close(); throw error; }

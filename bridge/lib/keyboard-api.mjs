@@ -73,12 +73,12 @@ export function createKeyboardController(native, { now = () => performance.now()
           attempted = true;
           const sent = JSON.parse(native.press(lease.target.id, textInput ? shortcut.text : KEY_CODES[shortcut.key], flags, remainingMs));
           if (sent.posted !== true || sent.target?.id !== lease.target.id) throw new Error('invalid native reply');
-          onPosted({ owner, key: textInput ? null : shortcut.key, target: sent.target, uncertain: Boolean(sent.targetChangedDuringPost) });
+          onPosted({ owner, key: textInput ? null : shortcut.key, modifiers: shortcut.modifiers, target: sent.target, uncertain: Boolean(sent.targetChangedDuringPost) });
           result = reply(200, { operationId: body.operationId, ...sent, confirmed: false,
             message: sent.targetChangedDuringPost ? '投递期间前台应用变化，结果未确认，请勿自动重发' : textInput ? '文字已投递，请在 Mac 确认内容；未自动提交' : '按键已投递，应用执行结果未确认' });
         }
       } catch (error) {
-        if (attempted) onPosted({ owner, key: textInput ? null : shortcut.key, target: lease.target, uncertain: true });
+        if (attempted) onPosted({ owner, key: textInput ? null : shortcut.key, modifiers: shortcut.modifiers, target: lease.target, uncertain: true });
         const status = { PERMISSION: 403, TARGET_CHANGED: 409, STALE: 409, INVALID: 400 }[error.code];
         result = reply(status || 500, { error: status ? error.message : '按键结果未确认，请勿自动重发', posted: status ? false : null });
       }

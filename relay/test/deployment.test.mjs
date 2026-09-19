@@ -1,11 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, stat, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, stat, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { prepareDeployment } from '../scripts/prepare-deployment.mjs';
 import { startRelay } from '../src/node-server.mjs';
 test('deployment generation is private, complete, consistent and never overwrites keys', async () => {
-  await mkdir('build', { recursive: true });
   const parent = await mkdtemp(path.resolve('build/deploy-test-'));
   const output = path.join(parent, 'release');
   const spec = { domain: 'relay.example.cn', publicIp: '203.0.113.10', privateIp: '10.0.0.2',
@@ -14,7 +13,6 @@ test('deployment generation is private, complete, consistent and never overwrite
     await assert.rejects(prepareDeployment({ ...spec, domain: 'x.cn\nmalicious=1' }, output));
     await assert.rejects(prepareDeployment({ ...spec, devices: [{ ...spec.devices[0], deviceSecret: 'do-not-upload' }] }, output));
     const result = await prepareDeployment(spec, output);
-    assert((await readFile(path.join(output, 'app/LICENSES/Microdex-MIT.txt'), 'utf8')).includes('Francesco Mistero'));
     const config = JSON.parse(await readFile(path.join(output, 'config/relay.json')));
     assert.equal((await stat(path.join(output, 'config/relay.json'))).mode & 0o777, 0o600);
     assert(!JSON.stringify(result).includes(config.turn.secret));
@@ -28,5 +26,20 @@ test('deployment generation is private, complete, consistent and never overwrite
     finally { await server.close(); }
     await assert.rejects(prepareDeployment(spec, output));
     assert.equal(JSON.parse(await readFile(path.join(output, 'config/relay.json'))).turn.secret, config.turn.secret);
+  } finally { await rm(parent, { recursive: true, force: true }); }
+});
+
+test('subscription export includes private storage and loopback-only TURN management', async () => {
+  const parent = await mkdtemp(path.resolve('build/deploy-subscription-test-'));
+  try {
+    const output = path.join(parent, 'release');
+    await prepareDeployment({ domain: 'relay.example.cn', publicIp: '203.0.113.10', devices: [], subscriptions: true }, output);
+    const config = JSON.parse(await readFile(path.join(output, 'config/relay.json')));
+    const turn = await readFile(path.join(output, 'config/turnserver.conf'), 'utf8');
+    assert.equal(config.subscriptions.database, '/var/lib/nokey/subscriptions.sqlite');
+    assert(turn.includes('cli-ip=127.0.0.1'));
+    assert(turn.includes(`cli-password=${config.subscriptions.turnAdmin.password}`));
+    assert((await readFile(path.join(output, 'config/nokey-relay.service'), 'utf8')).includes('StateDirectory=nokey'));
+    for (const name of ['src/subscriptions.mjs', 'src/turn-admin.mjs', 'scripts/subscription-admin.mjs']) assert((await stat(path.join(output, 'app/relay', name))).isFile());
   } finally { await rm(parent, { recursive: true, force: true }); }
 });

@@ -208,7 +208,7 @@ test('joystick slots migrate six-key layouts without changing user keys and pers
   const old = defaultProgrammedKeys().slice(0, 6);
   const next = parseGenericProgrammedKeys(JSON.stringify(old));
   assert.deepEqual(next.slice(0, 6), old);
-  assert.deepEqual(next.slice(6), [null, null, null, null]);
+  assert.deepEqual(next.slice(6).map(key => key.action.key), ['ArrowUp', 'ArrowRight', 'ArrowDown', 'ArrowLeft']);
   next[7] = { keycapId: 'EMPT5', label: '搜索', action: { type: 'shortcut', key: 'F', modifiers: ['command'] } };
   assert.deepEqual(parseGenericProgrammedKeys(JSON.stringify(next)), next);
   next[7].action.key = 'invalid';

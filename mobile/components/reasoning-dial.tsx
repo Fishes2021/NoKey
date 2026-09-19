@@ -303,13 +303,13 @@ export function ReasoningDial({
   ]);
 
   const accessibilityLabel = mode === 'reasoning'
-    ? `Reasoning ${label}`
+    ? `推理强度 ${label}`
     : mode === 'composer-navigation'
-      ? 'Composer navigation'
-      : 'Conversation scroll';
+      ? '旋钮移动光标'
+      : '滚动对话';
   const accessibilityHint = mode === 'reasoning'
-    ? 'Slide up or right to increase. Slide down or left to decrease. Tap to cycle, hold for settings.'
-    : 'Rotate to move, tap to select, or hold for settings.';
+    ? '向上或向右增加，向下或向左减少，长按打开设置。'
+    : '旋转移动光标；点按不会发送回车，长按打开设置。';
 
   return (
     <GestureDetector gesture={dialGesture}>

@@ -12,31 +12,33 @@ export async function prepareDeployment(spec, destination) {
   if (typeof domain !== 'string' || domain.length > 253 || !domain.includes('.') ||
       !domain.split('.').every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) ||
       !isIPv4(publicIp) || !isIPv4(privateIp)) throw new Error('需要纯小写域名、公网 IPv4 和网卡 IPv4');
-  if (!Array.isArray(devices) || !devices.length || devices.length > 100 || devices.some(device =>
+  if (!Array.isArray(devices) || (!devices.length && !spec.subscriptions) || devices.length > 100 || devices.some(device =>
       !/^[A-Za-z0-9_-]{20,64}$/.test(device.deviceId || '') || !/^[a-f0-9]{64}$/.test(device.secretHash || '') ||
       Object.keys(device).some(key => !['deviceId', 'secretHash'].includes(key))) ||
       new Set(devices.map(device => device.deviceId)).size !== devices.length)
     throw new Error('需要至少一台 Mac 登记信息，仅接受 deviceId 和 secretHash，不能上传原始密钥');
   const secret = randomBytes(32).toString('hex');
   const turn = { secret, urls: [`turn:${domain}:3478?transport=udp`, `turn:${domain}:3478?transport=tcp`, `turns:${domain}:5349?transport=tcp`], ttlSeconds: 3600 };
-  issueTurnCredentials({ ...turn, deviceId: devices[0].deviceId });
+  issueTurnCredentials({ ...turn, deviceId: devices[0]?.deviceId || 'configuration_validation' });
   // Exclusive directory creation prevents accidental secret rotation or overwrites.
   await mkdir(destination, { mode: 0o700 });
   await mkdir(path.join(destination, 'config'), { mode: 0o700 });
-  for (const relative of ['package.json', 'package-lock.json', 'LICENSE', 'LICENSES/Microdex-MIT.txt', 'THIRD_PARTY_NOTICES.md', 'relay/src/node-server.mjs',
-    'relay/src/index.js', 'relay/src/turn-credentials.mjs', 'bridge/lib/remote-relay.mjs', 'mobile/lib/ice-config.mjs']) {
+  for (const relative of ['package.json', 'package-lock.json', 'LICENSE', 'LICENSES/Microdex-MIT.txt', 'relay/src/node-server.mjs',
+    'relay/src/index.js', 'relay/src/turn-credentials.mjs', 'relay/src/subscriptions.mjs', 'relay/src/turn-admin.mjs', 'relay/scripts/subscription-admin.mjs', 'bridge/lib/remote-relay.mjs', 'mobile/lib/ice-config.mjs']) {
     const target = path.join(destination, 'app', relative);
     await mkdir(path.dirname(target), { recursive: true }); await copyFile(path.join(root, relative), target);
   }
   const save = (name, content) => writeFile(path.join(destination, name), content, { mode: 0o600, flag: 'wx' });
+  const subscriptions = spec.subscriptions ? { database: '/var/lib/nokey/subscriptions.sqlite', turnAdmin: { port: 5766, password: randomBytes(32).toString('base64url') } } : undefined;
   await save('config/relay.json', JSON.stringify({ publicOrigin: `https://${domain}`, host: '127.0.0.1', port: 8787,
-    devices: Object.fromEntries(devices.map(device => [device.deviceId, device.secretHash])), turn }, null, 2) + '\n');
+    devices: Object.fromEntries(devices.map(device => [device.deviceId, device.secretHash])), turn, ...(subscriptions ? { subscriptions } : {}) }, null, 2) + '\n');
   let coturn = await readFile(path.join(root, 'relay/deploy/turnserver.example.conf'), 'utf8');
   coturn = coturn.replaceAll('turn.example', domain).replaceAll('10.0.0.2', privateIp).replaceAll('203.0.113.10', publicIp)
     .replace('static-auth-secret=\n', `static-auth-secret=${secret}\n`)
     .replaceAll('/etc/voicedeck/tls/turn-fullchain.pem', `/etc/letsencrypt/live/${domain}/fullchain.pem`)
     .replaceAll('/etc/voicedeck/tls/turn-key.pem', `/etc/letsencrypt/live/${domain}/privkey.pem`);
   if (publicIp === privateIp) coturn = coturn.replace(/^external-ip=.*\n/m, '');
+  if (subscriptions) coturn = coturn.replace('no-cli', `cli\ncli-ip=127.0.0.1\ncli-port=5766\ncli-password=${subscriptions.turnAdmin.password}\ncli-max-output-sessions=1024`);
   await save('config/turnserver.conf', coturn);
   const nginx = (await readFile(path.join(root, 'relay/deploy/nginx.example.conf'), 'utf8')).replaceAll('relay.example', domain)
     .replaceAll('/etc/voicedeck/tls/relay-fullchain.pem', `/etc/letsencrypt/live/${domain}/fullchain.pem`)
@@ -60,6 +62,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 UMask=0077
+StateDirectory=nokey
 [Install]
 WantedBy=multi-user.target
 `);

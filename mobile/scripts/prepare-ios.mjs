@@ -24,7 +24,7 @@ const projects = (await readdir(path.join(work, 'ios'))).filter(name => name.end
 assert.equal(projects.length, 1);
 const project = path.join(work, 'ios', projects[0]);
 const pbx = await readFile(path.join(project, 'project.pbxproj'), 'utf8');
-assert(pbx.includes('org.voicedeck.mobile'));
+assert(pbx.includes('site.fishcloud.nokey'));
 const podfile = await readFile(path.join(work, 'ios/Podfile'), 'utf8');
 assert(podfile.includes('use_expo_modules!'));
 const infoResult = spawnSync('plutil', ['-convert', 'json', '-o', '-', path.join(work, 'ios', path.basename(project, '.xcodeproj'), 'Info.plist')], { encoding: 'utf8' });
@@ -36,7 +36,7 @@ const delegate = await readFile(path.join(work, 'ios', path.basename(project, '.
 assert(delegate.includes('UIWindow(windowScene: windowScene)'));
 assert(!delegate.includes('UIWindow(frame: UIScreen.main.bounds)'));
 assert.equal(delegate.match(/startReactNative\(/g)?.length, 1);
-assert.equal(info.CFBundleDisplayName, '语音快捷键盘');
+assert.equal(info.CFBundleDisplayName, 'NoKey');
 assert.deepEqual(info.UIBackgroundModes, ['audio']);
 assert(info.NSMicrophoneUsageDescription.includes('实时传送'));
 assert(info.NSLocalNetworkUsageDescription.includes('Mac'));

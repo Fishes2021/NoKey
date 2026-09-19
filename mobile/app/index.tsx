@@ -1,3 +1,4 @@
+import { requireOptionalNativeModule } from 'expo';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Clipboard from 'expo-clipboard';
@@ -34,7 +35,7 @@ import { runOnJS } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useGenericKeyboard } from '@/hooks/use-generic-keyboard';
-import { KEY_CODES, MODIFIER_FLAGS, normalizeShortcut, type ShortcutModifier } from '@/lib/keyboard-shortcuts.mjs';
+import { KEY_CODES, MODIFIER_FLAGS, keyboardKeyLabel, normalizeShortcut, type ShortcutModifier } from '@/lib/keyboard-shortcuts.mjs';
 import { programmedKeysStorageKey, parseGenericProgrammedKeys, type ProgrammedKeyAction } from '@/lib/programmed-keys';
 import { usePhoneMicrophone } from '@/hooks/use-phone-microphone';
 import ChatDrawer, { type ChatDrawerHandle } from '@/components/chat-drawer';
@@ -56,6 +57,7 @@ import {
   QueuedMessage,
   RemoteState,
   ReasoningEffort,
+  configureBridgeRoutes, onBridgeRoutesChanged, resetBridgeRoute, setBridgeDiscovery,
   bridgeEventAuthentication,
   bridgeEventsUrl,
   bridgeRequest as realBridgeRequest,
@@ -109,6 +111,8 @@ type JoystickDirection = 'up' | 'right' | 'down' | 'left';
 type EncoderMode = 'reasoning' | 'composer-navigation' | 'conversation-scroll';
 type InfoSheet = 'about' | 'privacy' | 'support' | 'licenses';
 type BridgeRequestOptions = {
+  signal?: AbortSignal;
+  timeoutMs?: number;
   method?: 'GET' | 'POST';
   body?: Record<string, unknown>;
 };
@@ -277,6 +281,9 @@ export default function ControllerScreen() {
   const [status, setStatus] = useState<BridgeStatus | null>(
     VISUAL_PREVIEW ? VISUAL_PREVIEW_STATUS : null,
   );
+  const [connectionIssue, setConnectionIssue] = useState('');
+  const [foreground, setForeground] = useState(AppState.currentState === 'active');
+  const connectionAbort = useRef<AbortController | null>(null);
   const [remote, setRemote] = useState<RemoteState | null>(
     VISUAL_PREVIEW ? VISUAL_PREVIEW_REMOTE : null,
   );
@@ -331,10 +338,14 @@ export default function ControllerScreen() {
   const [shortcutModifiers, setShortcutModifiers] = useState<ShortcutModifier[]>([]);
   const [keysLoadedFor, setKeysLoadedFor] = useState<string | null>(null);
   const [keysSaving, setKeysSaving] = useState(false);
+  const keyProfile = useRef<{ keyId: string; macId: string; revision: number } | null>(null);
   const keySaveInFlight = useRef(false);
   const keysDevice = e2ee?.keyId ?? null;
   const keysDeviceRef = useRef(keysDevice); keysDeviceRef.current = keysDevice;
   const keysReady = Boolean(keysDevice && keysLoadedFor === keysDevice);
+  useEffect(() => onBridgeRoutesChanged((keyId, addresses) => {
+    void writeStoredValue(`nokey.routes.${keyId}`, JSON.stringify(addresses)).catch(() => { setNotice('连接地址缓存保存失败，重开后可能需要重新查找 Mac'); setNoticeError(true); });
+  }), []);
   const genericKeyboard = useGenericKeyboard(bridgeUrl, token, e2ee, Boolean(status) && !demoMode);
   const [encoderMode, setEncoderMode] = useState<EncoderMode>('reasoning');
   const [guideVisible, setGuideVisible] = useState(false);
@@ -346,53 +357,50 @@ export default function ControllerScreen() {
 
   const keyboardNow = useRef(genericKeyboard); keyboardNow.current = genericKeyboard;
   const dictationStopping = useRef(false);
+  const dictationSendDelay = useRef(350);
   const sendInFlight = useRef(false);
-  const dictationSession = useRef<{ target: string; pending: boolean; request: Promise<boolean> | null } | null>(null);
+  const dictationSession = useRef<{ pending: boolean } | null>(null);
   const togglePhoneDictation = useCallback(async () => {
     if (dictationStopping.current) return false;
     if (phoneMicrophone.active) {
       dictationStopping.current = true; setDictationEnding(true);
-      const session = dictationSession.current;
       dictationSession.current = null;
-
-      let ended = false;
       try {
-        if (session?.request && await session.request) {
-          if (keyboardNow.current.target?.id === session.target) {
-            ended = await keyboardNow.current.press({ key: 'RightOption', modifiers: [] });
-          } else {
-            setNotice('Mac 前台应用已变化，语音输入开关未切换；手机已停止采音。'); setNoticeError(true);
-          }
-        }
-      } finally { await phoneMicrophone.stop(); dictationStopping.current = false; setDictationEnding(false); setDictationLinked(false); }
-      return ended;
+        const result = await phoneMicrophone.stop();
+        const ended = result?.dictationStopped === true;
+        dictationSendDelay.current = Number.isInteger(result?.sendDelayMs) && result!.sendDelayMs! >= 0 && result!.sendDelayMs! <= 3000 ? result!.sendDelayMs! : 350;
+        if (!ended) { setNotice(result?.dictationError || '听写结束未确认，请在 Mac 检查'); setNoticeError(true); }
+        return ended;
+      } finally { dictationStopping.current = false; setDictationEnding(false); setDictationLinked(false); }
+    }
+    if (AppState.currentState !== 'active' || genericKeyboard.connection !== 'online') {
+      setNotice(genericKeyboard.connection === 'offline' ? 'Mac 未连接，请打开 NoKey。' : genericKeyboard.connection === 'subscription' ? genericKeyboard.message : genericKeyboard.connection === 'unauthorized' ? '授权已失效，请重新配对。' : '正在确认 Mac 连接，请稍后再试。'); setNoticeError(true); return false;
     }
     setDictationLinked(false);
     setNoticeError(false);
     if (!genericKeyboard.target) {
       dictationSession.current = null;
-      setNotice(`麦克风可独立使用；语音开关联动暂不可用：${genericKeyboard.message}`); setNoticeError(true);
+      setNotice(''); setNoticeError(false);
       await phoneMicrophone.toggle();
       return;
     }
-    dictationSession.current = { target: genericKeyboard.target.id, pending: true, request: null };
-    await phoneMicrophone.toggle();
+    dictationSession.current = { pending: true };
+    await phoneMicrophone.toggle(genericKeyboard.dictationLeaseId);
   }, [phoneMicrophone, genericKeyboard]);
   useEffect(() => {
     const session = dictationSession.current;
     if (!session?.pending || phoneMicrophone.state !== 'speaking' || !phoneMicrophone.telemetry.inputSelected) return;
-    session.pending = false; // A reconnect must never toggle dictation again.
-    if (genericKeyboard.target?.id === session.target) {
-      session.request = genericKeyboard.press({ key: 'RightOption', modifiers: [] });
-      void session.request.then(posted => {
-        if (dictationSession.current !== session) return;
-        setDictationLinked(posted);
-        if (!posted) { setNotice('仅传音，听写启动未确认；请结束后重试'); setNoticeError(true); }
-      });
-    } else {
-      setNotice('Mac 输入目标已变化，本次仅传音；请结束后重新开始讲话。'); setNoticeError(true);
+    if (phoneMicrophone.telemetry.dictationManaged) {
+      if (!phoneMicrophone.telemetry.dictationLinked && !phoneMicrophone.telemetry.dictationError) return;
+      session.pending = false;
+      setDictationLinked(phoneMicrophone.telemetry.dictationLinked === true);
+      if (phoneMicrophone.telemetry.dictationError) { setNotice(phoneMicrophone.telemetry.dictationError); setNoticeError(true); }
+      return;
     }
-  }, [phoneMicrophone.state, phoneMicrophone.telemetry.inputSelected, genericKeyboard]);
+    session.pending = false;
+    setNotice('Mac 版本不支持统一语音控制，请更新桌面端；本次仅传音。'); setNoticeError(true);
+
+  }, [phoneMicrophone.state, phoneMicrophone.telemetry, genericKeyboard]);
   useEffect(() => { dictationSession.current = null; }, [bridgeUrl, token, e2ee]);
 
   const [completionLight, setCompletionLight] = useState(false);
@@ -414,7 +422,22 @@ export default function ControllerScreen() {
   /** Set when the Mac rejected the saved credential, which stops the retry loop. */
   const credentialRejected = useRef(false);
   const incomingUrl = Linking.useLinkingURL();
+  useEffect(() => {
+    const native = requireOptionalNativeModule<{ discoverBridges(): Promise<string[]>; cancelDiscovery(): void }>('VoiceDeckAudio');
+    let generation = 0;
+    setBridgeDiscovery(async signal => {
+      if (!native || AppState.currentState !== 'active' || signal.aborted) return [];
+      const run = ++generation;
+      const cancel = () => { if (run === generation) native.cancelDiscovery(); };
+      signal.addEventListener('abort', cancel, { once: true });
+      try { return await native.discoverBridges(); }
+      finally { signal.removeEventListener('abort', cancel); }
+    });
+    return () => { generation++; native?.cancelDiscovery(); setBridgeDiscovery(async () => []); };
+  }, []);
   const networkState = Network.useNetworkState();
+  useEffect(() => { resetBridgeRoute(e2ee, AppState.currentState === 'active'); }, [e2ee, networkState.type, networkState.isConnected]);
+
   const appInfo = useMemo(() => mobileAppInfo(), []);
 
   useEffect(() => {
@@ -536,7 +559,7 @@ export default function ControllerScreen() {
   const tryOpenChatFromSwipe = useCallback(() => {
     if (!status) {
       setSettingsVisible(true);
-      announce('Connect the bridge first, then swipe to open chats.', true);
+      announce('请先连接电脑', true);
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
       return;
     }
@@ -610,6 +633,13 @@ export default function ControllerScreen() {
       if (savedUrl && !EXPO_BRIDGE_TOKEN) setBridgeUrl(savedUrl);
       setToken(EXPO_BRIDGE_TOKEN || savedToken || '');
       if (savedUrl) registerBridgeEncryption(savedUrl, encryption);
+      if (savedUrl && encryption) {
+        try {
+          const routes = await readStoredValue(`nokey.routes.${encryption.keyId}`);
+          if (cancelled) return;
+          if (routes) configureBridgeRoutes(savedUrl, savedToken || '', encryption, JSON.parse(routes));
+        } catch { /* Keep the original paired address if the optional cache is damaged. */ }
+      }
       setE2ee(encryption);
       if (
         savedEncoderMode === 'reasoning' ||
@@ -631,28 +661,53 @@ export default function ControllerScreen() {
   }, [credentialLoadAttempt]);
 
   useEffect(() => {
-    let cancelled = false;
-    setEditingSlot(null); setKeyManagerVisible(false); setKeysLoadedFor(null);
-    setProgrammedKeys(defaultProgrammedKeys());
-    if (keysDevice) void readStoredValue(programmedKeysStorageKey(keysDevice)).then(raw => {
-      if (!cancelled) { setProgrammedKeys(parseGenericProgrammedKeys(raw)); setKeysLoadedFor(keysDevice); }
-    }).catch(() => { if (!cancelled) announce('快捷配置读取失败，请重新连接后重试', true); });
-    return () => { cancelled = true; };
-  }, [keysDevice, announce]);
+    keyProfile.current = null; setKeysLoadedFor(null);
+    setEditingSlot(null); setKeyManagerVisible(false); setProgrammedKeys(defaultProgrammedKeys());
+  }, [keysDevice]);
+
+  useEffect(() => {
+    if (!keysDevice || !e2ee || !foreground || genericKeyboard.connection !== 'online') return;
+    const abort = new AbortController();
+    type Profile = { macId: string; revision: number; keys: (ProgrammedKey | null)[] | null };
+    void (async () => {
+      let profile = await realBridgeRequest<Profile>(bridgeUrl, token, '/api/preferences/keys', { signal: abort.signal }, e2ee);
+      if (abort.signal.aborted) return;
+      if (!/^[A-Za-z0-9_-]{20,64}$/.test(profile.macId) || !Number.isSafeInteger(profile.revision)) throw Error('Mac 返回的快捷配置无效');
+      if (profile.keys === null) {
+        const legacy = await readStoredValue(programmedKeysStorageKey(keysDevice));
+        const stable = await readStoredValue(`nokey.keys.mac.${profile.macId}`);
+        if (abort.signal.aborted) return;
+        const keys = parseGenericProgrammedKeys(stable || legacy);
+        profile = await realBridgeRequest<Profile>(bridgeUrl, token, '/api/preferences/keys', { method: 'POST', signal: abort.signal, body: { revision: profile.revision, keys } }, e2ee);
+      }
+      if (abort.signal.aborted || keysDeviceRef.current !== keysDevice) return;
+      if (keyProfile.current?.keyId === keysDevice && keyProfile.current.revision > profile.revision) return;
+      const keys = parseGenericProgrammedKeys(JSON.stringify(profile.keys));
+      keyProfile.current = { keyId: keysDevice, macId: profile.macId, revision: profile.revision };
+      setProgrammedKeys(keys); setKeysLoadedFor(keysDevice);
+      try { await writeStoredValue(`nokey.keys.mac.${profile.macId}`, JSON.stringify(keys)); }
+      catch { if (!abort.signal.aborted) announce('Mac 配置已恢复，手机缓存保存失败', true); }
+    })().catch(error => { if (!abort.signal.aborted) announce(`快捷配置同步失败，请确认 Mac 已更新：${readableError(error)}`, true); });
+    return () => abort.abort();
+  }, [keysDevice, e2ee, bridgeUrl, token, foreground, genericKeyboard.connection, keyManagerVisible, announce]);
 
   const persistProgrammedKeys = useCallback(async (nextKeys: (ProgrammedKey | null)[]) => {
-    if (!keysReady || !keysDevice || keysDeviceRef.current !== keysDevice || keySaveInFlight.current) return false;
+    const profile = keyProfile.current;
+    if (!keysReady || !keysDevice || !profile || profile.keyId !== keysDevice || keysDeviceRef.current !== keysDevice || keySaveInFlight.current) return false;
     keySaveInFlight.current = true; setKeysSaving(true);
     try {
-      await writeStoredValue(programmedKeysStorageKey(keysDevice), JSON.stringify(nextKeys));
+      const keys = parseGenericProgrammedKeys(JSON.stringify(nextKeys));
+      const saved = await realBridgeRequest<{ revision: number }>(bridgeUrl, token, '/api/preferences/keys', { method: 'POST', body: { revision: profile.revision, keys } }, e2ee);
       if (keysDeviceRef.current !== keysDevice) return false;
-      setProgrammedKeys(nextKeys);
+      keyProfile.current = { ...profile, revision: saved.revision }; setProgrammedKeys(keys);
+      try { await writeStoredValue(`nokey.keys.mac.${profile.macId}`, JSON.stringify(keys)); }
+      catch { announce('配置已保存到 Mac；手机缓存未写入，下次会从 Mac 恢复', true); }
       return true;
     } catch {
-      if (keysDeviceRef.current === keysDevice) announce('快捷配置保存失败，原配置已保留', true);
+      if (keysDeviceRef.current === keysDevice) announce('保存结果未确认，请重新打开快捷键设置同步；不会自动重发', true);
       return false;
     } finally { keySaveInFlight.current = false; setKeysSaving(false); }
-  }, [keysDevice, keysReady, announce]);
+  }, [keysDevice, keysReady, bridgeUrl, token, e2ee, announce]);
 
   useEffect(() => {
     if (loadingAction === 'reasoning') return;
@@ -770,12 +825,13 @@ export default function ControllerScreen() {
     candidateE2EE: E2EEKeyMaterial | null = e2ee,
   ) => {
     if (!candidateUrl.trim() || !candidateToken.trim()) {
-      if (interactive) announce('Enter the bridge address and access code.', true);
+      if (interactive) announce('请输入电脑连接地址和配对信息。', true);
       return false;
     }
-    if (connectionInFlight.current) return false;
+    if (AppState.currentState !== 'active' || connectionInFlight.current) return false;
     connectionInFlight.current = true;
     const generation = ++connectionGeneration.current;
+    const abort = new AbortController(); connectionAbort.current = abort;
     setBridgeConnecting(true);
     if (interactive) setLoadingAction('connect');
     try {
@@ -784,7 +840,7 @@ export default function ControllerScreen() {
         candidateUrl,
         candidateToken,
         '/api/status',
-        {},
+        { signal: abort.signal, timeoutMs: 3000 },
         candidateE2EE,
       );
       if (generation !== connectionGeneration.current) return false;
@@ -802,23 +858,20 @@ export default function ControllerScreen() {
       setBridgeUrl(candidateUrl.trim());
       setToken(candidateToken.trim());
       setE2ee(candidateE2EE);
-      setStatus(nextStatus);
+      setStatus(nextStatus); setConnectionIssue('');
       if (nextStatus.remote?.online) setRemote(nextStatus.remote as RemoteState);
       setSettingsVisible(false);
       setScannerVisible(false);
       reconnectAttempt.current = 0;
       credentialRejected.current = false;
-      announce(
-        candidateUrl.trim().startsWith('https://')
-          ? 'Secure remote bridge connected. Microdex now works on Wi-Fi or mobile data.'
-          : 'Local bridge connected. The keys now control Codex.',
-      );
+      announce('已连接到配对的 Mac，连接通道会自动选择。');
       if (interactive) {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
       return true;
     } catch (error) {
       if (generation !== connectionGeneration.current) return false;
+      setConnectionIssue(readableError(error));
       setStatus(null);
       setRemote(null);
       // A rejected credential is final. Say so once and drop the stale token, so
@@ -883,6 +936,7 @@ export default function ControllerScreen() {
       try { await saving; }
       finally { if (pairingSave.current === saving) pairingSave.current = null; }
       if (controller.signal.aborted) return false;
+      if (credentials.e2ee && credentials.routes) configureBridgeRoutes(credentials.bridgeUrl, credentials.token, credentials.e2ee, credentials.routes);
       setBridgeUrl(credentials.bridgeUrl);
       setToken(credentials.token);
       setE2ee(credentials.e2ee ?? null);
@@ -945,7 +999,7 @@ export default function ControllerScreen() {
       'Revoke data-processing consent?',
       'Microdex will keep the saved Mac pairing, but Codex controls will remain blocked until you consent again. Microphone and generic shortcuts stay available.',
       [
-        { text: 'Cancel', style: 'cancel' },
+        { text: '取消', style: 'cancel' },
         {
           text: 'Revoke',
           style: 'destructive',
@@ -1124,6 +1178,7 @@ export default function ControllerScreen() {
 
   useEffect(() => {
     if (
+      !foreground ||
       !credentialsReady ||
       status ||
       !bridgeUrl.trim() ||
@@ -1136,6 +1191,7 @@ export default function ControllerScreen() {
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     const reconnect = async () => {
+      if (cancelled || AppState.currentState !== 'active') return;
       const connected = await connectToBridge(bridgeUrl, token);
       if (cancelled || connected || credentialRejected.current) return;
       reconnectAttempt.current += 1;
@@ -1151,6 +1207,7 @@ export default function ControllerScreen() {
     bridgeUrl,
     connectToBridge,
     credentialsReady,
+    foreground,
     networkState.isConnected,
     networkState.type,
     status,
@@ -1159,13 +1216,19 @@ export default function ControllerScreen() {
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (nextState) => {
-      if (nextState === 'active' && !status) {
-        reconnectAttempt.current = 0;
-        void connectToBridge(bridgeUrl, token);
-      }
+      const active = nextState === 'active';
+      setForeground(active);
+      if (!active) {
+        connectionGeneration.current++;
+        connectionAbort.current?.abort();
+        connectionInFlight.current = false;
+        setBridgeConnecting(false);
+        dictationSession.current = null;
+        setDictationLinked(false);
+      } else reconnectAttempt.current = 0;
     });
     return () => subscription.remove();
-  }, [bridgeUrl, connectToBridge, status, token]);
+  }, []);
 
   const requireBridge = useCallback(() => {
     if (!demoMode && !aiConsent) {
@@ -1174,12 +1237,12 @@ export default function ControllerScreen() {
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
       return false;
     }
-    if (status) return true;
+    if (demoMode || (foreground && status && genericKeyboard.connection === 'online')) return true;
     setSettingsVisible(true);
-    announce('Connect the bridge running on your computer first.', true);
+    announce('请先连接电脑上的 NoKey。', true);
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
     return false;
-  }, [aiConsent, announce, demoMode, status]);
+  }, [aiConsent, announce, demoMode, status, foreground, genericKeyboard.connection]);
 
   const requireVerifiedSettings = useCallback(() => {
     if (
@@ -1619,7 +1682,7 @@ export default function ControllerScreen() {
       'Archive this chat?',
       `“${thread.name}” will disappear from Microcodex and the active chats on your Mac. You can recover it from the Codex archive.`,
       [
-        { text: 'Cancel', style: 'cancel' },
+        { text: '取消', style: 'cancel' },
         {
           text: 'Archive',
           style: 'destructive',
@@ -1644,7 +1707,7 @@ export default function ControllerScreen() {
       `Archive “${project}”?`,
       `${projectThreads.length} project chats will be archived. The folder and files on your Mac will not be deleted.`,
       [
-        { text: 'Cancel', style: 'cancel' },
+        { text: '取消', style: 'cancel' },
         {
           text: 'Archive project',
           style: 'destructive',
@@ -1694,7 +1757,7 @@ export default function ControllerScreen() {
     setChosenActionId('voicedeck.shortcut');
     setCustomPrompt('');
     setKeyLabel(current?.label ?? '');
-    setShortcutKey(current?.action?.type === 'shortcut' ? current.action.key : 'Enter');
+    setShortcutKey(current?.action?.type === 'shortcut' ? current.action.key : slotIndex >= 6 ? ['ArrowUp', 'ArrowRight', 'ArrowDown', 'ArrowLeft'][slotIndex - 6] : 'Enter');
     setShortcutModifiers(current?.action?.type === 'shortcut' ? current.action.modifiers : []);
     setActionSearch('');
     void Haptics.selectionAsync();
@@ -1703,7 +1766,7 @@ export default function ControllerScreen() {
   const saveProgrammedKey = useCallback(async () => {
     if (editingSlot === null || !chosenAction) return;
     if (chosenAction.custom && !customPrompt.trim()) {
-      announce('Write the custom prompt for this key.', true);
+      announce('请填写此按键的自定义内容。', true);
       return;
     }
     // Keep keycapId in storage and in the bridge payload for compatibility
@@ -1726,7 +1789,7 @@ export default function ControllerScreen() {
       ? { keycapId, action: assignedAction, ...(keyLabel.trim() ? { label: keyLabel.trim() } : {}) } : key);
     if (!await persistProgrammedKeys(nextKeys)) return;
     setEditingSlot(null);
-    announce(`${chosenAction.label} assigned to key ${editingSlot + 1}.`);
+    announce(`已保存第 ${editingSlot + 1} 个快捷键`);
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   }, [
     announce,
@@ -1742,7 +1805,7 @@ export default function ControllerScreen() {
       index === slotIndex ? null : key,
     );
     if (!await persistProgrammedKeys(nextKeys)) return false;
-    announce(`Key ${slotIndex + 1} removed and ready to program.`);
+    announce(slotIndex >= 6 ? '已恢复该方向的默认光标移动' : `已清除第 ${slotIndex + 1} 个快捷键`);
     await Haptics.selectionAsync();
     return true;
   }, [announce, programmedKeys, persistProgrammedKeys]);
@@ -1755,18 +1818,18 @@ export default function ControllerScreen() {
   const clearAllProgrammedKeys = useCallback(() => {
     if (!programmedKeys.some(Boolean)) return;
     Alert.alert(
-      'Clear all programmable keys?',
-      'This removes every custom key assignment. The fixed Microdex controls stay unchanged.',
+      '清除全部自定义快捷键?',
+      '这会清除普通槽位的自定义动作，并恢复摇杆方向键。固定按键保持不变。',
       [
-        { text: 'Cancel', style: 'cancel' },
+        { text: '取消', style: 'cancel' },
         {
-          text: 'Clear all',
+          text: '清除全部',
           style: 'destructive',
           onPress: () => {
             void (async () => {
               const nextKeys = programmedKeys.map(() => null);
               if (!await persistProgrammedKeys(nextKeys)) return;
-              announce('All programmable keys cleared.');
+              announce('自定义快捷键已清除，摇杆已恢复方向键。');
               await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
             })();
           },
@@ -1786,8 +1849,8 @@ export default function ControllerScreen() {
       try {
         if (dictationActive) {
           if (!await togglePhoneDictation()) { announce('听写结束未确认，未发送；请检查后重试', true); return; }
-          // ponytail: input methods have no shared completion API; allow 350ms to commit trailing text.
-          await new Promise(resolve => setTimeout(resolve, 350));
+          // ponytail: no shared input-method completion API; use the Mac session’s configured delay.
+          await new Promise(resolve => setTimeout(resolve, dictationSendDelay.current));
         }
         if (!targetId || keyboardNow.current.target?.id !== targetId) { announce('输入目标已变化，未发送', true); return; }
         const posted = await keyboardNow.current.press(action);
@@ -1839,13 +1902,21 @@ export default function ControllerScreen() {
     }
   }, [announce, bridgeRequest, bridgeUrl, handleActionError, requireBridge, token]);
 
-  const handleJoystickDirection = useCallback(async (direction: JoystickDirection) => {
+  const joystickSession = useRef<{ target: string; identity: string; action: Extract<ProgrammedKeyAction, { type: 'shortcut' }> } | null>(null);
+  const handleJoystickDirection = useCallback(async (direction: JoystickDirection, repeat: boolean) => {
     const slot = { up: 6, right: 7, down: 8, left: 9 }[direction];
-    if (!keysReady || keysSaving) return;
-    const action = programmedKeys[slot]?.action;
-    if (action?.type !== 'shortcut') { openKeyEditor(slot); return; }
-    await genericKeyboard.press(action, true);
-  }, [genericKeyboard, programmedKeys, keysReady, keysSaving, openKeyEditor]);
+    if (!keysReady || keysSaving || !keysDevice || !genericKeyboard.target) return false;
+    if (!repeat) {
+      const action = programmedKeys[slot]?.action;
+      if (action?.type !== 'shortcut') return false;
+      joystickSession.current = { target: genericKeyboard.target.id, identity: keysDevice, action };
+    }
+    const session = joystickSession.current;
+    if (!session || session.target !== genericKeyboard.target.id || session.identity !== keysDevice) return false;
+    const movement = /^Arrow(Up|Down|Left|Right)$/.test(session.action.key) && session.action.modifiers.length === 0;
+    if ((repeat || dictationActive) && !movement) return false;
+    return genericKeyboard.press(session.action, true);
+  }, [genericKeyboard, programmedKeys, keysDevice, keysReady, keysSaving, dictationActive]);
 
   const resolveApproval = useCallback(async (decision: 'approve' | 'decline') => {
     if (!requireActionAvailable(decision === 'approve' ? 'APPR' : 'REJ')) return;
@@ -2105,7 +2176,7 @@ export default function ControllerScreen() {
 
                   <Pressable
                     accessibilityRole="button"
-                    accessibilityLabel="Explore Microdex without a Mac"
+                    accessibilityLabel="无需连接，先查看面板"
                     onPress={() => void enterDemo()}
                     style={({ pressed }) => [
                       styles.gateDemoButton,
@@ -2141,7 +2212,7 @@ export default function ControllerScreen() {
           automaticallyAdjustKeyboardInsets
           showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
-          <Text style={{ color: status ? theme.online : theme.textMuted, fontSize: 14 }}>{status ? '● Mac 已连接' : '○ Mac 未连接'}</Text>
+          <Text style={{ color: foreground && status && genericKeyboard.connection === 'online' ? theme.online : theme.textMuted, fontSize: 14 }}>{demoMode || (foreground && status && genericKeyboard.connection === 'online') ? `● Mac 已连接 · ${genericKeyboard.transport === 'relay' ? '异网中继' : '局域网直连'}` : genericKeyboard.connection === 'subscription' ? '○ 中继服务未授权或已到期' : genericKeyboard.connection === 'unauthorized' ? '○ 请重新配对' : status && genericKeyboard.connection === 'checking' || bridgeConnecting ? '○ 正在确认连接' : '○ Mac 未连接'}</Text>
           <Pressable accessibilityRole="button" accessibilityLabel="打开 NoKey 设置"
             onPress={() => setSettingsVisible(true)} style={styles.statusButton}>
             <CentralIcon name="settings" size={20} color={theme.text} />
@@ -2165,9 +2236,11 @@ export default function ControllerScreen() {
                     <ReasoningDial mode="composer-navigation" label="旋转移动" index={0} maxIndex={1}
                       onPreview={() => {}} onCommit={() => {}} onLongPress={() => setSettingsVisible(true)}
                       onStep={genericKeyboard.moveCursor}
-                      onPress={() => { if (dictationActive) announce('请先结束讲话', true); else void genericKeyboard.press({ key: 'Enter', modifiers: [] }); }} />
+                      onPress={() => {}} />
                   </View>
-                  <View style={{ width: '100%', aspectRatio: 1 }}><Joystick onDirection={direction => void handleJoystickDirection(direction)} onConfigure={direction => openKeyEditor({ up: 6, right: 7, down: 8, left: 9 }[direction])} labels={{ up: programmedKeys[6]?.label, right: programmedKeys[7]?.label, down: programmedKeys[8]?.label, left: programmedKeys[9]?.label }} /></View>
+                  <View style={{ width: '100%', aspectRatio: 1 }}><Joystick onDirection={handleJoystickDirection}
+                    enabled={keysReady && !keysSaving && foreground && genericKeyboard.connection === 'online' && !settingsVisible && !keyManagerVisible && editingSlot === null}
+                    resetKey={`${keysDevice}:${genericKeyboard.target?.id || ''}`} labels={{ up: programmedKeys[6]?.label, right: programmedKeys[7]?.label, down: programmedKeys[8]?.label, left: programmedKeys[9]?.label }} /></View>
                 </View>
               </View>
               <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
@@ -2192,7 +2265,7 @@ export default function ControllerScreen() {
         </View>
         <View style={{ minHeight: 44, paddingHorizontal: 6, paddingBottom: 8, gap: 3 }} accessibilityLiveRegion="polite">
           <Text style={{ color: noticeError ? theme.dangerText : theme.textMuted, fontSize: 12 }}>
-            {phoneMicrophone.telemetry.inputError || (noticeError && notice ? notice : dictationLinked && dictationActive ? '正在讲话 · 再点长条结束' : phoneMicrophone.message || genericKeyboard.message)}
+            {(!status && connectionIssue) || phoneMicrophone.telemetry.inputError || (noticeError && notice ? notice : dictationLinked && dictationActive ? '正在讲话 · 再点长条结束' : phoneMicrophone.state === 'speaking' && phoneMicrophone.telemetry.received && !dictationSession.current ? `仅传音，快捷键暂不可用：${genericKeyboard.message}` : phoneMicrophone.message || genericKeyboard.message)}
           </Text>
           {!!genericKeyboard.result && <Text style={{ color: theme.textMuted, fontSize: 12 }}>{genericKeyboard.result}</Text>}
         </View>
@@ -2298,11 +2371,11 @@ export default function ControllerScreen() {
                 <SheetHandlePill color={theme.borderStrong} />
                 <View style={styles.sheetTitleRow}>
                   <View>
-                    <Text style={styles.sheetKicker}>YOUR MICRODEX</Text>
-                    <Text style={styles.sheetTitle}>Customize keys</Text>
+                    <Text style={styles.sheetKicker}>我的快捷面板</Text>
+                    <Text style={styles.sheetTitle}>自定义快捷键</Text>
                   </View>
                   <Pressable
-                    accessibilityLabel="Close key manager"
+                    accessibilityLabel="关闭快捷键管理"
                     onPress={() => setKeyManagerVisible(false)}
                     style={styles.closeButton}>
                     <CentralIcon name="close" size={20} color={theme.text} />
@@ -2311,8 +2384,7 @@ export default function ControllerScreen() {
               </>
             }>
             <Text style={styles.sheetBody}>
-              Choose an empty key or replace an existing one. Use the trash button to remove an
-              assignment and turn it back into an empty programmable key.
+              选择需要调整的快捷键。清除普通槽位后可重新配置；清除摇杆自定义动作会恢复对应方向键。
             </Text>
             <ScrollView style={{ flexShrink: 1 }} contentContainerStyle={styles.keyManagerGrid}>
               {programmedKeys.map((programmed, slotIndex) => {
@@ -2324,8 +2396,8 @@ export default function ControllerScreen() {
                       accessibilityRole="button"
                       accessibilityLabel={
                         action
-                          ? `Change key ${slotIndex + 1}, currently ${programmed?.label || action.label}`
-                          : `Choose action for key ${slotIndex + 1}`
+                          ? `修改第 ${slotIndex + 1} 个快捷键，当前为${programmed?.label || action.label}`
+                          : `配置第 ${slotIndex + 1} 个快捷键`
                       }
                       onPress={() => {
                         setKeyManagerVisible(false);
@@ -2346,14 +2418,14 @@ export default function ControllerScreen() {
                           <CentralIcon name="plus" size={24} color={theme.blue} />
                         )}
                       </View>
-                      <Text style={styles.keyManagerSlot}>{slotIndex >= 6 ? `摇杆 · ${['上', '右', '下', '左'][slotIndex - 6]}` : `KEY ${slotIndex + 1}`}</Text>
+                      <Text style={styles.keyManagerSlot}>{slotIndex >= 6 ? `摇杆 · ${['上', '右', '下', '左'][slotIndex - 6]}` : `快捷键 ${slotIndex + 1}`}</Text>
                       <Text adjustsFontSizeToFit minimumFontScale={0.72} numberOfLines={1} style={styles.keyManagerLabel}>
-                        {programmed?.label || action?.label || (programmed ? 'Choose command' : 'Choose action')}
+                        {programmed?.label || action?.label || (programmed ? '选择快捷键' : '设置动作')}
                       </Text>
                     </Pressable>
                     <Pressable
                       accessibilityRole="button"
-                      accessibilityLabel={`Remove key ${slotIndex + 1}`}
+                      accessibilityLabel={`清除第 ${slotIndex + 1} 个快捷键`}
                       disabled={!programmed}
                       onPress={() => void removeProgrammedKey(slotIndex)}
                       style={({ pressed }) => [
@@ -2362,7 +2434,7 @@ export default function ControllerScreen() {
                         pressed && styles.removeKeyButtonPressed,
                       ]}>
                       <CentralIcon name="trash" size={16} color={theme.danger} />
-                      <Text style={styles.removeKeyText}>REMOVE</Text>
+                      <Text style={styles.removeKeyText}>清除</Text>
                     </Pressable>
                   </View>
                 );
@@ -2377,7 +2449,7 @@ export default function ControllerScreen() {
             </Pressable>
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel="Clear all programmable keys"
+              accessibilityLabel="清除全部自定义快捷键"
               disabled={!programmedKeys.some(Boolean)}
               onPress={clearAllProgrammedKeys}
               style={({ pressed }) => [
@@ -2386,7 +2458,7 @@ export default function ControllerScreen() {
                 pressed && styles.removeKeyButtonPressed,
               ]}>
               <CentralIcon name="trash" size={17} color={theme.danger} />
-              <Text style={styles.clearAllKeysText}>CLEAR ALL</Text>
+              <Text style={styles.clearAllKeysText}>清除全部</Text>
             </Pressable>
           </DismissibleSheet>
         </View>
@@ -2422,7 +2494,7 @@ export default function ControllerScreen() {
                     </Text>
                   </View>
                   <Pressable
-                    accessibilityLabel="Close key catalog"
+                    accessibilityLabel="关闭快捷键配置"
                     onPress={() => setEditingSlot(null)}
                     style={styles.closeButton}>
                     <CentralIcon name="close" size={20} color={theme.text} />
@@ -2431,7 +2503,7 @@ export default function ControllerScreen() {
               </>
             }>
             <Text style={styles.sheetBody}>
-              设置通用快捷键，发送到 Mac 当前应用。摇杆四个方向可以分别设置。
+              设置发送到 Mac 当前应用的快捷键。摇杆默认四向移动；自定义非方向动作每次只执行一次，不会按住重复。
             </Text>
             <View style={styles.searchWrap}>
               <CentralIcon name="search" size={18} color={theme.textFaint} />
@@ -2506,21 +2578,21 @@ export default function ControllerScreen() {
             <TextInput accessibilityLabel="快捷键显示名称" maxLength={24} value={keyLabel}
               onChangeText={setKeyLabel} placeholder="显示名称（可选）" placeholderTextColor={theme.textFaint} style={[styles.input, { minHeight: 44, flexShrink: 0 }]} />
             {chosenAction?.id === 'voicedeck.shortcut' && <View style={{ gap: 8, marginVertical: 8 }}>
-              <Text style={styles.sheetBody}>组合键：{[...shortcutModifiers, shortcutKey].join(' + ')}（Mac 物理键位）</Text>
+              <Text style={styles.sheetBody}>组合键：{[...shortcutModifiers, shortcutKey].map(keyboardKeyLabel).join(' + ')}（Mac 物理键位）</Text>
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
                 {(Object.keys(MODIFIER_FLAGS) as ShortcutModifier[]).map(modifier => <Pressable key={modifier}
-                  accessibilityRole="button" accessibilityLabel={`修饰键 ${modifier}`}
+                  accessibilityRole="button" accessibilityLabel={`修饰键 ${keyboardKeyLabel(modifier)}`}
                   accessibilityState={{ selected: shortcutModifiers.includes(modifier) }}
                   onPress={() => setShortcutModifiers(current => current.includes(modifier) ? current.filter(item => item !== modifier) : [...current, modifier])}
                   style={[styles.clearButton, shortcutModifiers.includes(modifier) && { borderColor: theme.blue, borderWidth: 1 }]}>
-                  <Text style={styles.clearButtonText}>{shortcutModifiers.includes(modifier) ? '✓ ' : ''}{modifier}</Text>
+                  <Text style={styles.clearButtonText}>{shortcutModifiers.includes(modifier) ? '✓ ' : ''}{keyboardKeyLabel(modifier)}</Text>
                 </Pressable>)}
               </View>
               <ScrollView horizontal keyboardShouldPersistTaps="handled" style={{ maxHeight: 52 }}>
-                {Object.keys(KEY_CODES).map(key => <Pressable key={key} accessibilityRole="button" accessibilityLabel={`主键 ${key}`}
+                {Object.keys(KEY_CODES).map(key => <Pressable key={key} accessibilityRole="button" accessibilityLabel={`主键 ${keyboardKeyLabel(key)}`}
                   accessibilityState={{ selected: shortcutKey === key }} onPress={() => setShortcutKey(key)}
                   style={[styles.clearButton, { marginRight: 6 }, shortcutKey === key && { borderColor: theme.blue, borderWidth: 1 }]}>
-                  <Text style={styles.clearButtonText}>{shortcutKey === key ? '✓ ' : ''}{key}</Text>
+                  <Text style={styles.clearButtonText}>{shortcutKey === key ? '✓ ' : ''}{keyboardKeyLabel(key)}</Text>
                 </Pressable>)}
               </ScrollView>
             </View>}
@@ -2530,7 +2602,7 @@ export default function ControllerScreen() {
                 multiline
                 value={customPrompt}
                 onChangeText={setCustomPrompt}
-                placeholder="Example: Review the current changes and fix the tests."
+                placeholder="例如：检查当前修改并修复测试。"
                 placeholderTextColor={theme.textFaint}
                 style={[styles.input, styles.customPromptInput]}
               />
@@ -2542,7 +2614,7 @@ export default function ControllerScreen() {
                 onPress={() => void clearProgrammedKey()}
                 style={({ pressed }) => [styles.clearButton, pressed && styles.guideButtonPressed]}>
                 <CentralIcon name="trash" size={18} color={theme.textMuted} />
-                <Text style={styles.clearButtonText}>CLEAR</Text>
+                <Text style={styles.clearButtonText}>清除</Text>
               </Pressable>
               <Pressable
                 accessibilityRole="button"
@@ -2588,7 +2660,7 @@ export default function ControllerScreen() {
                     <Text style={styles.sheetTitle}>操作说明</Text>
                   </View>
                   <Pressable
-                    accessibilityLabel="Close key guide"
+                    accessibilityLabel="关闭操作说明"
                     onPress={() => setGuideVisible(false)}
                     style={styles.closeButton}>
                     <CentralIcon name="close" size={20} color={theme.text} />
@@ -2601,7 +2673,7 @@ export default function ControllerScreen() {
               contentContainerStyle={styles.guideContent}>
               <GuideItem styles={styles} theme={theme} icon="microphone" title="讲话与结束" body="长条点一次开始，再点一次结束。结束后核对电脑文字，点发送提交。" />
               <GuideItem styles={styles} theme={theme} icon="keyboard-outline" title="通用键盘" body="按键作用于 Mac 当前输入位置。长按功能键可以配置系统快捷键；填入文字不会自动提交。" />
-              <GuideItem styles={styles} theme={theme} icon="gamepad-round-outline" title="光标和窗口" body="摇杆发送方向键；旋钮左右移动光标，按下回车。切换应用键点击切到上一个应用，长按切换同一应用的窗口。" />
+              <GuideItem styles={styles} theme={theme} icon="gamepad-round-outline" title="光标和窗口" body="摇杆按住方向连续移动，松手停止；旋钮只负责左右移动光标。切换应用键点击切到上一个应用，长按切换同一应用的窗口。" />
             </ScrollView>
           </DismissibleSheet>
         </View>
@@ -2626,9 +2698,9 @@ export default function ControllerScreen() {
               <>
                 <SheetHandlePill color={theme.borderStrong} />
                 <View style={styles.sheetTitleRow}>
-                  <Text style={styles.sheetTitle}>Settings</Text>
+                  <Text style={styles.sheetTitle}>设置</Text>
                   <Pressable
-                    accessibilityLabel="Close settings"
+                    accessibilityLabel="关闭设置"
                     onPress={() => setSettingsVisible(false)}
                     style={styles.closeButton}>
                     <CentralIcon name="close" size={18} color={theme.text} />
@@ -2663,7 +2735,7 @@ export default function ControllerScreen() {
                 <Text style={styles.settingsLinkMeta}>在 Mac 打开“NoKey”客户端，扫描其中的配对二维码，并在 Mac 确认。</Text>
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel="Scan computer pairing QR"
+                  accessibilityLabel="扫描电脑配对二维码"
                   onPress={() => void openPairingScanner()}
                   style={({ pressed }) => [
                     styles.settingsPrimaryButton,
@@ -2681,7 +2753,7 @@ export default function ControllerScreen() {
               </View>
 
               <View style={styles.settingsGroup}>
-                <Text style={styles.settingsGroupLabel}>Appearance</Text>
+                <Text style={styles.settingsGroupLabel}>外观</Text>
                 <View style={styles.themeSegment}>
                   {(['light', 'dark'] as const).map((option) => {
                     const active = mode === option;
@@ -2701,7 +2773,7 @@ export default function ControllerScreen() {
                           color={active ? theme.text : theme.textMuted}
                         />
                         <Text style={[styles.themeSegmentText, active && styles.themeSegmentTextActive]}>
-                          {option === 'dark' ? 'Dark' : 'Light'}
+                          {option === 'dark' ? '深色' : '浅色'}
                         </Text>
                       </Pressable>
                     );
@@ -2710,8 +2782,8 @@ export default function ControllerScreen() {
               </View>
 
               <View style={styles.settingsGroup}>
-                <Text style={styles.settingsGroupLabel}>Controller</Text>
-                <Text style={styles.settingsLinkMeta}>旋钮左右移动光标，按下回车；摇杆发送方向键。</Text>
+                <Text style={styles.settingsGroupLabel}>快捷操作</Text>
+                <Text style={styles.settingsLinkMeta}>旋钮左右移动光标；摇杆按住方向连续移动，松手停止。自定义动作请在下方设置。</Text>
                 <Pressable
                   accessibilityRole="button"
                   onPress={() => {
@@ -2719,7 +2791,7 @@ export default function ControllerScreen() {
                     setKeyManagerVisible(true);
                   }}
                   style={({ pressed }) => [styles.settingsLinkRow, pressed && styles.settingsLinkRowPressed]}>
-                  <Text style={styles.settingsLinkTitle}>Customize keys</Text>
+                  <Text style={styles.settingsLinkTitle}>自定义快捷键</Text>
                   <CentralIcon name="chevronRight" size={18} color={theme.textFaint} />
                 </Pressable>
                 <Pressable
@@ -2729,23 +2801,23 @@ export default function ControllerScreen() {
                     setGuideVisible(true);
                   }}
                   style={({ pressed }) => [styles.settingsLinkRow, pressed && styles.settingsLinkRowPressed]}>
-                  <Text style={styles.settingsLinkTitle}>Controls guide</Text>
+                  <Text style={styles.settingsLinkTitle}>操作说明</Text>
                   <CentralIcon name="chevronRight" size={18} color={theme.textFaint} />
                 </Pressable>
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel="Copy diagnostic report"
+                  accessibilityLabel="复制诊断报告"
                   onPress={() => void copyDiagnostics()}
                   style={({ pressed }) => [styles.settingsLinkRow, pressed && styles.settingsLinkRowPressed]}>
-                  <Text style={styles.settingsLinkTitle}>Copy diagnostics</Text>
+                  <Text style={styles.settingsLinkTitle}>复制诊断信息</Text>
                   <CentralIcon name="copy" size={16} color={theme.textFaint} />
                 </Pressable>
               </View>
 
               <View style={styles.settingsGroup}>
-                <Text style={styles.settingsGroupLabel}>Offline Experience</Text>
+                <Text style={styles.settingsGroupLabel}>离线预览</Text>
                 <Text style={styles.settingsSupportingText}>
-                  The offline preview runs entirely on this device with fictional tasks. It never contacts a Mac, Cloudflare or OpenAI.
+                  离线预览仅在本机展示模拟内容，不会连接电脑或外部服务。
                 </Text>
                 <Pressable
                   accessibilityRole="button"
@@ -2755,7 +2827,7 @@ export default function ControllerScreen() {
                     pressed && styles.settingsLinkRowPressed,
                   ]}>
                   <Text style={styles.settingsLinkTitle}>
-                    {demoMode ? 'Exit offline preview' : '先查看面板'}
+                    {demoMode ? '退出离线预览' : '先查看面板'}
                   </Text>
                   <MaterialCommunityIcons
                     name={demoMode ? 'exit-to-app' : 'play-outline'}
@@ -2771,7 +2843,7 @@ export default function ControllerScreen() {
                       styles.settingsLinkRow,
                       pressed && styles.settingsLinkRowPressed,
                     ]}>
-                    <Text style={styles.settingsLinkTitle}>Pair a real Mac</Text>
+                    <Text style={styles.settingsLinkTitle}>连接真实 Mac</Text>
                     <CentralIcon name="qrCode" size={16} color={theme.textFaint} />
                   </Pressable>
                 ) : null}
@@ -2798,7 +2870,7 @@ export default function ControllerScreen() {
                   accessibilityRole="button"
                   onPress={() => showInfoSheet('licenses')}
                   style={({ pressed }) => [styles.settingsLinkRow, pressed && styles.settingsLinkRowPressed]}>
-                  <Text style={styles.settingsLinkTitle}>Licenses & Attributions</Text>
+                  <Text style={styles.settingsLinkTitle}>开源许可与致谢</Text>
                   <CentralIcon name="chevronRight" size={18} color={theme.textFaint} />
                 </Pressable>
                 <Pressable
@@ -2808,7 +2880,7 @@ export default function ControllerScreen() {
                   <View>
                     <Text style={styles.settingsLinkTitle}>关于NoKey</Text>
                     <Text style={styles.settingsLinkMeta}>
-                      Version {appInfo.version} ({appInfo.buildNumber})
+                      版本 {appInfo.version} ({appInfo.buildNumber})
                     </Text>
                   </View>
                   <CentralIcon name="chevronRight" size={18} color={theme.textFaint} />
@@ -2823,7 +2895,7 @@ export default function ControllerScreen() {
                     styles.settingsDangerLink,
                     pressed && styles.gateButtonPressed,
                   ]}>
-                  <Text style={styles.settingsDangerLinkText}>Forget this Mac and consent</Text>
+                  <Text style={styles.settingsDangerLinkText}>移除此 Mac 并清除同意记录</Text>
                 </Pressable>
               ) : null}
             </ScrollView>
@@ -2853,11 +2925,11 @@ export default function ControllerScreen() {
                   <SheetHandlePill color={theme.borderStrong} />
                   <View style={styles.sheetTitleRow}>
                     <View style={styles.consentTitleCopy}>
-                      <Text style={styles.sheetKicker}>YOUR DATA, YOUR CHOICE</Text>
+                      <Text style={styles.sheetKicker}>你的数据，由你决定</Text>
                       <Text style={styles.sheetTitle}>Codex 操作如何处理内容</Text>
                     </View>
                     <Pressable
-                      accessibilityLabel="Close data processing information"
+                      accessibilityLabel="关闭数据处理说明"
                       onPress={declineAiConsent}
                       style={styles.closeButton}>
                       <CentralIcon name="close" size={19} color={theme.text} />
@@ -2909,7 +2981,7 @@ export default function ControllerScreen() {
                         styles.consentSecondaryButton,
                         pressed && styles.gateButtonPressed,
                       ]}>
-                      <Text style={styles.consentSecondaryButtonText}>KEEP ENABLED</Text>
+                      <Text style={styles.consentSecondaryButtonText}>保持启用</Text>
                     </Pressable>
                     <Pressable
                       accessibilityRole="button"
@@ -2921,7 +2993,7 @@ export default function ControllerScreen() {
                         styles.consentDangerButton,
                         pressed && styles.gateButtonPressed,
                       ]}>
-                      <Text style={styles.consentDangerButtonText}>REVOKE</Text>
+                      <Text style={styles.consentDangerButtonText}>撤销同意</Text>
                     </Pressable>
                   </>
                 ) : (
@@ -2933,7 +3005,7 @@ export default function ControllerScreen() {
                         styles.consentSecondaryButton,
                         pressed && styles.gateButtonPressed,
                       ]}>
-                      <Text style={styles.consentSecondaryButtonText}>NOT NOW</Text>
+                      <Text style={styles.consentSecondaryButtonText}>暂不设置</Text>
                     </Pressable>
                     <Pressable
                       accessibilityRole="button"
@@ -2942,7 +3014,7 @@ export default function ControllerScreen() {
                         styles.consentPrimaryButton,
                         pressed && styles.gateButtonPressed,
                       ]}>
-                      <Text style={styles.consentPrimaryButtonText}>CONTINUE</Text>
+                      <Text style={styles.consentPrimaryButtonText}>继续</Text>
                       <CentralIcon name="check" size={18} color={theme.bg} />
                     </Pressable>
                   </>
@@ -2981,12 +3053,12 @@ export default function ControllerScreen() {
                           : infoSheet === 'support'
                             ? '使用帮助'
                             : infoSheet === 'licenses'
-                              ? 'Licenses & Attributions'
+                              ? '开源许可与致谢'
                               : '关于NoKey'}
                       </Text>
                     </View>
                     <Pressable
-                      accessibilityLabel="Close information"
+                      accessibilityLabel="关闭说明"
                       onPress={() => setInfoSheet(null)}
                       style={styles.closeButton}>
                       <CentralIcon name="close" size={19} color={theme.text} />
@@ -3005,13 +3077,13 @@ export default function ControllerScreen() {
                       你点击开始讲话后，iPhone 采集麦克风声音，经加密实时连接传到已配对 Mac 的虚拟麦克风。本产品不默认保存录音、不提供转写历史；接收声音的输入法、录音或识别应用如何保存和处理声音，由该应用及你的设置决定。语音不经 Codex 转发。
                     </Text>
                     <Text style={styles.infoParagraph}>
-                      已开启的讲话可在锁屏或后台继续；停止讲话会释放采音。来电等系统中断会结束本次采音，需要主动恢复。连接中断超过产品设定的恢复时限会停止采音。后台和中断行为仍需 iPhone 真机验收。
+                      切到后台或锁屏会停止采音、连接检查和重连。回到前台只恢复连接检查，不会自动开始讲话。来电等系统中断也会结束本次采音；重新讲话需主动点击。
                     </Text>
                     <Text style={styles.infoParagraph}>
                       快捷指令和 Mac 返回的任务信息在手机与 Mac 之间加密传输。只有使用 Codex 功能时，相关任务内容才由 Mac 上的 Codex 及其服务处理；Codex 同意与通用麦克风、通用快捷键独立。撤销 Codex 同意阻止后续 Codex 操作，不会删除已经提交给其服务的数据。
                     </Text>
                     <Text style={styles.infoParagraph}>
-                      配对地址、访问凭据和加密材料通过 iOS 安全存储保存；浏览器开发预览使用该浏览器的本地存储。Mac 客户端将配对与连接配置保存在用户 Application Support/VoiceDeck 目录。音量与快捷槽配置也保存在本地。相机只用于扫码，产品不保存或上传扫码画面。
+                      配对地址、访问凭据和加密材料通过 iOS 安全存储保存；浏览器开发预览使用该浏览器的本地存储。Mac 客户端将配对与连接配置保存在用户 Application Support/VoiceDeck 目录。音量保存在手机本地；快捷键布局保存在配对的 Mac，手机保存缓存，重新配对后从 Mac 恢复。相机只用于扫码，产品不保存或上传扫码画面。
                     </Text>
                     <Text style={styles.infoParagraph}>
                       直连不可用时，配置的连接或媒体中继可处理 IP 地址、时间、连接标识和加密流量大小。媒体和控制内容加密，不能据此声称没有网络元数据。国内节点是部署要求，当前自部署服务的地址、日志和保留期限由部署者配置；未部署的服务不能视为已经提供。当前构建关闭 Expo 在线更新；iOS、TestFlight 或 App Store 自身服务适用各自说明。
@@ -3033,7 +3105,7 @@ export default function ControllerScreen() {
                   </>
                 ) : infoSheet === 'licenses' ? (
                   <>
-                    <Text style={styles.infoLead}>Open source, with attribution.</Text>
+                    <Text style={styles.infoLead}>开源与致谢</Text>
                     <Text style={styles.infoParagraph}>
                       本产品复用 Microdex 的 MIT 许可代码，以及 BlackHole 的 GPL-3.0 许可驱动代码。各组件保留原有声明，不能把整套产品概括为 MIT。键帽素材及其他第三方内容的再分发条件需在公开发布前逐项确认。
                     </Text>
@@ -3048,7 +3120,7 @@ export default function ControllerScreen() {
                       accessibilityRole="link"
                       onPress={() => void openExternal(THIRD_PARTY_LICENSE_URL, 'Third-party licenses')}
                       style={({ pressed }) => [styles.infoSecondaryAction, pressed && styles.gateButtonPressed]}>
-                      <Text style={styles.infoSecondaryActionText}>THIRD-PARTY NOTICES</Text>
+                      <Text style={styles.infoSecondaryActionText}>第三方声明</Text>
                       <CentralIcon name="link" size={16} color={theme.text} />
                     </Pressable>
                   </>
@@ -3060,7 +3132,7 @@ export default function ControllerScreen() {
                       NoKey是基于开源项目开发的独立产品，将手机实时麦克风与快捷面板整合到一起。Codex 是可选功能，不包含其账号或服务。下方链接为上游参考项目，并非本改版的发布或支持渠道。
                     </Text>
                     <Text style={styles.infoVersion}>
-                      APP {appInfo.version} ({appInfo.buildNumber}) · {demoMode ? 'OFFLINE PREVIEW' : `BRIDGE ${status?.bridge?.version ?? 'OFFLINE'}`}
+                      应用 {appInfo.version} ({appInfo.buildNumber}) · {demoMode ? '离线预览' : `电脑端 ${status?.bridge?.version ?? '未连接'}`}
                     </Text>
                     <Pressable
                       accessibilityRole="link"
@@ -3092,12 +3164,12 @@ export default function ControllerScreen() {
           ) : null}
           <View style={[styles.scannerHeader, { paddingTop: insets.top + 12 }]}>
             <Pressable
-              accessibilityLabel="Close QR scanner"
+              accessibilityLabel="关闭扫码"
               onPress={() => setScannerVisible(false)}
               style={styles.scannerClose}>
               <CentralIcon name="close" size={23} color="#FFFFFF" />
             </Pressable>
-            <Text style={styles.scannerTitle}>Scan your computer</Text>
+            <Text style={styles.scannerTitle}>扫描电脑配对码</Text>
             <View style={styles.scannerHeaderSpacer} />
           </View>
           <View style={styles.scannerFrame}>

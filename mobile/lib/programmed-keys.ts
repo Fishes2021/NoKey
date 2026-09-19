@@ -195,7 +195,7 @@ export function defaultProgrammedKeys(): (ProgrammedKey | null)[] {
     keycapId: DEFAULT_MICRO_LAYOUT[index], label,
     action: { type: 'shortcut', key, modifiers: index === 4 ? ['shift'] : index === 5 ? ['command', 'shift'] : [] },
   }));
-  return [...keys, null, null, null, null];
+  return [...keys, ...(['ArrowUp', 'ArrowRight', 'ArrowDown', 'ArrowLeft'] as const).map((key, index): ProgrammedKey => ({ keycapId: 'NAV', label: ['上', '右', '下', '左'][index], action: { type: 'shortcut', key, modifiers: [] } }))];
 }
 
 const LEGACY_COMMAND_IDS: Readonly<Record<string, ProgrammableCommandId>> = {
@@ -327,6 +327,7 @@ export function parseProgrammedKeys(raw: string | null | undefined) {
 export function parseGenericProgrammedKeys(raw: string | null | undefined) {
   const defaults = defaultProgrammedKeys();
   return parseProgrammedKeys(raw).map((entry, index) =>
+    index >= 6 && (!entry || (entry.action?.type === 'shortcut' && entry.action.key === 'Enter' && entry.action.modifiers.length === 0 && !entry.label)) ? defaults[index] :
     entry?.action && (entry.action.type !== 'shortcut' ||
       (index === 4 && entry.label === '行首' && entry.action.key === 'Home' && entry.action.modifiers.length === 0) ||
       (index === 5 && entry.label === '行尾' && entry.action.key === 'End' && entry.action.modifiers.length === 0)) ? defaults[index] : entry);

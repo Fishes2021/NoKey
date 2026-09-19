@@ -1,0 +1,1 @@
+export function createHeldDirection(send: (direction: string, repeat: boolean) => Promise<boolean>, schedule?: typeof setTimeout, cancel?: typeof clearTimeout): { stop(): void; set(direction: string | null): void };

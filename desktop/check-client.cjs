@@ -17,6 +17,12 @@ async function finish(result) {
   app.quit();
 }
 app.whenReady().then(async () => {
+  const nativePath = require.resolve('../build/desktop/voice-output.node');
+  const native = require(nativePath);
+  let selectedInput = 'test-original';
+  require.cache[nativePath].exports = { ...native,
+    inputDevices: () => ['test-original', 'VoiceDeckMicrophone_UID'].map(uid => ({ uid, name: uid, selected: uid === selectedInput })),
+    selectInput: uid => { selectedInput = uid; return 0; } };
   const { startDesktop } = await import('./main.mjs');
   const stateDir = await fs.mkdtemp(path.join(root, 'identity-'));
   try {
@@ -25,6 +31,7 @@ app.whenReady().then(async () => {
       confirmPairing: async () => true });
     const wc = client.window.webContents;
     const state = await wc.executeJavaScript("window.desktopClient.action('state')");
+    assert.equal(selectedInput, 'VoiceDeckMicrophone_UID', 'startup selects virtual input');
     assert.equal(state.relayConfigured, false);
     assert.equal(state.pairingText, client.bridge.pairing().pairingUrl);
     assert.equal(state.deviceName, require('node:os').hostname());
@@ -34,6 +41,13 @@ app.whenReady().then(async () => {
     assert(await wc.executeJavaScript("document.getElementById('pairing-copy').disabled && document.getElementById('pairing-text').value === ''"));
     wc.send('desktop:state', state);
 
+    assert.equal(state.dictation.key, 'RightOption');
+    await assert.rejects(wc.executeJavaScript("window.desktopClient.action('dictation-save', {key:'Space',modifiers:['fn'],sendDelayMs:350})"), /Fn/);
+    await assert.rejects(wc.executeJavaScript("window.desktopClient.action('dictation-save', {key:'Space',modifiers:[],sendDelayMs:99999})"), /3000/);
+    const configured = await wc.executeJavaScript("window.desktopClient.action('dictation-save', {key:'Space',modifiers:['control','option'],sendDelayMs:800})");
+    assert.deepEqual(configured.dictation, {key:'Space',modifiers:['control','option'],sendDelayMs:800});
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(stateDir,'dictation.json'),'utf8')), configured.dictation);
+    assert.equal((await fs.stat(path.join(stateDir,'dictation.json'))).mode & 0o777, 0o600);
     assert.equal(state.shortcuts, false);
     wc.send('desktop:state', { ...state, relayConfigured: true, remoteStatus: 'offline', remoteReady: false, remoteError: 'Unexpected server response: 401', remoteRetryAt: Date.now() + 10000 });
     assert(await wc.executeJavaScript("document.getElementById('network').textContent.includes('自动重试')"));
@@ -54,6 +68,7 @@ app.whenReady().then(async () => {
     assert(await wc.executeJavaScript("document.getElementById('uninstall').disabled"));
     await assert.rejects(wc.executeJavaScript("window.desktopClient.action('uninstall')"), /一体化安装包/);
     assert.equal(state.keyboardEnabled, false);
+    await assert.rejects(wc.executeJavaScript("window.desktopClient.action('subscription-activate', 'NK-invalid')"), /服务地址|激活码/);
     for (const invalid of ['http://relay.example', 'https://relay.example/path', 'https://user:pass@relay.example', 'https://relay.example?q=1', 42]) {
       await assert.rejects(wc.executeJavaScript("window.desktopClient.action('connection-save', " + JSON.stringify(invalid) + ")"), /地址/);
     }
@@ -138,16 +153,24 @@ app.whenReady().then(async () => {
     await fs.writeFile(path.resolve(__dirname, '../build/desktop/client-preview.png'), (await wc.capturePage()).toPNG());
     await wc.executeJavaScript("document.getElementById('audio-title').scrollIntoView()");
     await fs.writeFile(path.resolve(__dirname, '../build/desktop/audio-guide-preview.png'), (await wc.capturePage()).toPNG());
+    await wc.executeJavaScript("window.desktopClient.action('keyboard')");
+    assert.equal(JSON.parse(await fs.readFile(path.join(stateDir, 'keyboard-enabled.json'), 'utf8')), true);
     const port = client.bridge.port;
     await client.close();
+    assert.equal(selectedInput, 'test-original', 'quit restores original input');
     await client.close();
     await assert.rejects(fetch(`http://127.0.0.1:${port}/health`));
     const savedToken = await fs.readFile(path.join(stateDir, 'bridge-token'), 'utf8');
     client = await startDesktop({ stateDir, show: false, host: '127.0.0.1', port: 0, confirmPairing: async () => true });
     assert.equal(await fs.readFile(path.join(stateDir, 'bridge-token'), 'utf8'), savedToken);
+    assert.equal((await client.window.webContents.executeJavaScript("window.desktopClient.action('state')")).keyboardEnabled, true, 'enabled preference survives restart');
+    assert.deepEqual((await client.window.webContents.executeJavaScript("window.desktopClient.action('state')")).dictation, {key:'Space',modifiers:['control','option'],sendDelayMs:800}, 'dictation settings survive restart');
+    await client.window.webContents.executeJavaScript("window.desktopClient.action('keyboard')");
+    assert.equal(JSON.parse(await fs.readFile(path.join(stateDir, 'keyboard-enabled.json'), 'utf8')), false);
     const nextPort = client.bridge.port;
     client.window.close();
     assert.equal(client.window.isDestroyed(), false, 'close must hide the audio owner window');
+    assert.equal(selectedInput, 'VoiceDeckMicrophone_UID', 'hiding retains virtual input');
     assert.equal(client.window.isVisible(), false);
     assert.equal((await fetch(`http://127.0.0.1:${nextPort}/health`)).status, 200);
     await client.window.webContents.executeJavaScript("document.getElementById('settings-toggle').click()");
@@ -159,6 +182,7 @@ app.whenReady().then(async () => {
       client = await startDesktop({ stateDir, show: false, host: '127.0.0.1', port: 0 });
       const recovery = client.window.webContents;
       const initial = await recovery.executeJavaScript("window.desktopClient.action('state')");
+      assert.equal(initial.keyboardEnabled, false, 'disabled preference survives restart');
       assert.equal(initial.configError, true);
       assert.equal(initial.relayConfigured, false);
       assert(await recovery.executeJavaScript("document.getElementById('connection-config-error').textContent.includes('备份失败则不覆盖')"));
