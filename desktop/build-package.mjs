@@ -12,7 +12,7 @@ assert(args.every(arg => ['--with-driver', '--release'].includes(arg)) && new Se
 const release = args.includes('--release');
 const withDriver = args.includes('--with-driver');
 assert.equal(process.platform, 'darwin');
-const name = 'NoKey', version = '0.1.0', identifier = 'org.voicedeck.desktop';
+const name = 'NoKey', version = '0.1.1', identifier = 'org.voicedeck.desktop';
 function run(command, args) {
   const result = spawnSync(command, args, { cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
   if (result.error || result.status !== 0) throw result.error || new Error(`${command}: ${result.stderr || result.stdout}`);
@@ -46,7 +46,7 @@ await writeFile(path.join(application, 'package.json'), JSON.stringify({
   license: 'GPL-3.0-only', dependencies: manifest.dependencies,
 }, null, 2));
 for (const relative of ['bridge/lib', 'bridge/server.mjs', 'bridge/hooks',
-  'desktop/assets/trayTemplate.png', 'desktop/assets/trayTemplate@2x.png', 'desktop/main.mjs', 'desktop/dictation-settings.mjs', 'desktop/subscription-client.mjs', 'desktop/microphone-selection.mjs', 'desktop/login-item.mjs', 'desktop/launch.mjs', 'desktop/voice-host.mjs', 'desktop/ice-provider.mjs',
+  'desktop/assets/trayTemplate.png', 'desktop/assets/trayTemplate@2x.png', 'desktop/main.mjs', 'desktop/dictation-settings.mjs', 'desktop/shortcut-recorder.mjs', 'desktop/subscription-client.mjs', 'desktop/microphone-selection.mjs', 'desktop/login-item.mjs', 'desktop/launch.mjs', 'desktop/voice-host.mjs', 'desktop/ice-provider.mjs',
   'mobile/lib/keyboard-shortcuts.mjs', 'mobile/lib/ice-config.mjs',
   'build/desktop/keyboard.node', 'build/desktop/voice-output.node']) {
   await copy(path.join(root, relative), path.join(application, relative));

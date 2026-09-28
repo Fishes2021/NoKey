@@ -13,14 +13,19 @@ export const KEY_CODES = Object.freeze({
   Home: 115, PageUp: 116, Delete: 117, End: 119, PageDown: 121,
   ArrowLeft: 123, ArrowRight: 124, ArrowDown: 125, ArrowUp: 126,
 });
-export const MODIFIER_FLAGS = Object.freeze({ command: 1 << 20, control: 1 << 18, option: 1 << 19, shift: 1 << 17, fn: 1 << 23 });
+export const MODIFIER_FLAGS = Object.freeze({ command: 1 << 20, control: 1 << 18, option: 1 << 19, shift: 1 << 17, fn: 1 << 23,
+  LeftCommand: (1 << 20) | 8, RightCommand: (1 << 20) | 16,
+  LeftControl: (1 << 18) | 1, RightControl: (1 << 18) | 8192,
+  LeftOption: (1 << 19) | 32, RightOption: (1 << 19) | 64,
+  LeftShift: (1 << 17) | 2, RightShift: (1 << 17) | 4 });
+const family = key => key.replace(/^(Left|Right)/, '').toLowerCase();
 export function normalizeShortcut(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
       typeof value.key !== 'string' || !Object.hasOwn(KEY_CODES, value.key) ||
       !Array.isArray(value.modifiers) || value.modifiers.length > 5 ||
-      (/^(Left|Right)(Option|Control|Shift|Command)$/.test(value.key) && value.modifiers.length !== 0) ||
+      (/^(Left|Right)(Option|Control|Shift|Command)$/.test(value.key) && value.modifiers.some(modifier => typeof modifier === 'string' && family(modifier) === family(value.key))) ||
       value.modifiers.some(modifier => typeof modifier !== 'string' || !Object.hasOwn(MODIFIER_FLAGS, modifier)) ||
-      new Set(value.modifiers).size !== value.modifiers.length) throw new Error('请选择有效的按键和修饰键');
+      new Set(value.modifiers.map(family)).size !== value.modifiers.length) throw new Error('请选择有效的按键和修饰键');
   return { key: value.key, modifiers: Object.keys(MODIFIER_FLAGS).filter(modifier => value.modifiers.includes(modifier)) };
 }
 

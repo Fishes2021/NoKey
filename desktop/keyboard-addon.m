@@ -12,9 +12,16 @@
 
 static const CGEventFlags modifierFlags[] = { kCGEventFlagMaskCommand, kCGEventFlagMaskControl,
     kCGEventFlagMaskAlternate, kCGEventFlagMaskShift, kCGEventFlagMaskSecondaryFn };
+static const CGEventFlags modifierDeviceFlags[] = { NX_DEVICELCMDKEYMASK, NX_DEVICELCTLKEYMASK,
+    NX_DEVICELALTKEYMASK, NX_DEVICELSHIFTKEYMASK, 0 };
+static const CGEventFlags rightDeviceFlags[] = { NX_DEVICERCMDKEYMASK, NX_DEVICERCTLKEYMASK,
+    NX_DEVICERALTKEYMASK, NX_DEVICERSHIFTKEYMASK, 0 };
+static const CGKeyCode rightModifierKeys[] = { kVK_RightCommand, kVK_RightControl, kVK_RightOption, kVK_RightShift, kVK_Function };
 static const CGKeyCode modifierKeys[] = { kVK_Command, kVK_Control, kVK_Option, kVK_Shift, kVK_Function };
 static const CGEventFlags allowedFlags = kCGEventFlagMaskCommand | kCGEventFlagMaskControl |
-    kCGEventFlagMaskAlternate | kCGEventFlagMaskShift | kCGEventFlagMaskSecondaryFn;
+    kCGEventFlagMaskAlternate | kCGEventFlagMaskShift | kCGEventFlagMaskSecondaryFn |
+    NX_DEVICELCMDKEYMASK | NX_DEVICERCMDKEYMASK | NX_DEVICELCTLKEYMASK | NX_DEVICERCTLKEYMASK |
+    NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK | NX_DEVICELSHIFTKEYMASK | NX_DEVICERSHIFTKEYMASK;
 typedef struct { CGEventRef events[402]; size_t count; } KeyEvents;
 static void clearEvents(KeyEvents *list) {
     for (size_t i = 0; i < list->count; ++i) CFRelease(list->events[i]);
@@ -30,6 +37,14 @@ static bool appendEvent(KeyEvents *list, CGEventSourceRef source, CGKeyCode key,
 // Allocate the complete down/up sequence first. Allocation failure never leaves a modifier down.
 static bool prepareKeys(KeyEvents *list, CGKeyCode key, CGEventFlags flags) {
     if (key > 127 || (flags & ~allowedFlags)) return false;
+    CGKeyCode keys[5]; CGEventFlags emitted[5];
+    for (size_t i = 0; i < 5; ++i) {
+        CGEventFlags sides = flags & (modifierDeviceFlags[i] | rightDeviceFlags[i]);
+        if (sides && (!(flags & modifierFlags[i]) || sides == (modifierDeviceFlags[i] | rightDeviceFlags[i]))) return false;
+        bool right = (flags & rightDeviceFlags[i]) != 0;
+        keys[i] = right ? rightModifierKeys[i] : modifierKeys[i];
+        emitted[i] = modifierFlags[i] | (right ? rightDeviceFlags[i] : modifierDeviceFlags[i]);
+    }
     CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStatePrivate);
     if (!source) return false;
     bool ok = true;
@@ -45,23 +60,34 @@ static bool prepareKeys(KeyEvents *list, CGKeyCode key, CGEventFlags flags) {
         case kVK_RightCommand: singleFlag = kCGEventFlagMaskCommand | NX_DEVICERCMDKEYMASK; break;
     }
     if (singleFlag) {
-        if (flags != 0) { CFRelease(source); return false; }
-        ok = appendEvent(list, source, key, true, singleFlag);
+        if (flags & singleFlag & allowedFlags) { CFRelease(source); return false; }
+        CGEventFlags active = 0;
+        for (size_t i = 0; ok && i < 5; ++i) if (flags & modifierFlags[i]) {
+            active |= emitted[i];
+            ok = appendEvent(list, source, keys[i], true, active);
+            if (ok) CGEventSetType(list->events[list->count - 1], kCGEventFlagsChanged);
+        }
+        if (ok) ok = appendEvent(list, source, key, true, active | singleFlag);
         if (ok) CGEventSetType(list->events[list->count - 1], kCGEventFlagsChanged);
-        if (ok) ok = appendEvent(list, source, key, false, 0);
+        if (ok) ok = appendEvent(list, source, key, false, active);
         if (ok) CGEventSetType(list->events[list->count - 1], kCGEventFlagsChanged);
+        for (int i = 4; ok && i >= 0; --i) if (flags & modifierFlags[i]) {
+            active &= ~emitted[i];
+            ok = appendEvent(list, source, keys[i], false, active);
+            if (ok) CGEventSetType(list->events[list->count - 1], kCGEventFlagsChanged);
+        }
         CFRelease(source);
         if (!ok) clearEvents(list);
         return ok;
     }
     CGEventFlags active = 0;
     for (size_t i = 0; ok && i < 5; ++i) if (flags & modifierFlags[i]) {
-        active |= modifierFlags[i]; ok = appendEvent(list, source, modifierKeys[i], true, active);
+        active |= emitted[i]; ok = appendEvent(list, source, keys[i], true, active);
     }
-    if (ok) ok = appendEvent(list, source, key, true, flags);
-    if (ok) ok = appendEvent(list, source, key, false, flags);
+    if (ok) ok = appendEvent(list, source, key, true, active);
+    if (ok) ok = appendEvent(list, source, key, false, active);
     for (int i = 4; ok && i >= 0; --i) if (flags & modifierFlags[i]) {
-        active &= ~modifierFlags[i]; ok = appendEvent(list, source, modifierKeys[i], false, active);
+        active &= ~emitted[i]; ok = appendEvent(list, source, keys[i], false, active);
     }
     CFRelease(source);
     if (!ok) clearEvents(list);
@@ -130,8 +156,41 @@ int main(void) {
             assert(prepareKeys(&single, singles[i], 0));
             assert(single.count == 2 && CGEventGetType(single.events[0]) == kCGEventFlagsChanged);
             assert(CGEventGetFlags(single.events[0]) != 0 && CGEventGetFlags(single.events[1]) == 0);
+            CGEventFlags ownFlag = CGEventGetFlags(single.events[0]) & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate | kCGEventFlagMaskShift);
             clearEvents(&single);
-            assert(!prepareKeys(&single, singles[i], kCGEventFlagMaskCommand));
+            assert(!prepareKeys(&single, singles[i], ownFlag));
+            for (unsigned combination = 0; combination < 16; ++combination) {
+                CGEventFlags flags = 0;
+                for (size_t m = 0; m < 4; ++m) if (combination & (1u << m)) flags |= modifierFlags[m];
+                if (flags & ownFlag) continue;
+                assert(prepareKeys(&single, singles[i], flags));
+                assert(single.count == 2 + 2 * (size_t)__builtin_popcount(combination));
+                for (size_t n = 0; n < single.count; ++n) {
+                    assert(CGEventGetType(single.events[n]) == kCGEventFlagsChanged);
+                    assert(CGEventGetIntegerValueField(single.events[n], kCGKeyboardEventKeycode) ==
+                        CGEventGetIntegerValueField(single.events[single.count - 1 - n], kCGKeyboardEventKeycode));
+                }
+                assert((CGEventGetFlags(single.events[single.count / 2 - 1]) & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate | kCGEventFlagMaskShift)) == (flags | ownFlag));
+                assert(CGEventGetFlags(single.events[single.count - 1]) == 0);
+                clearEvents(&single);
+            }
+        }
+        // Both recording orders must emit right Shift, never silently substitute left Shift.
+        CGKeyCode chordKeys[] = { kVK_RightCommand, kVK_RightShift };
+        CGEventFlags chordFlags[] = { kCGEventFlagMaskShift | NX_DEVICERSHIFTKEYMASK,
+            kCGEventFlagMaskCommand | NX_DEVICERCMDKEYMASK };
+        for (int order = 0; order < 2; ++order) {
+            KeyEvents chord = {0};
+            assert(prepareKeys(&chord, chordKeys[order], chordFlags[order]));
+            assert(chord.count == 4);
+            for (size_t n = 0; n < chord.count; ++n) {
+                CGKeyCode code = (CGKeyCode)CGEventGetIntegerValueField(chord.events[n], kCGKeyboardEventKeycode);
+                assert(code == kVK_RightCommand || code == kVK_RightShift);
+                assert(!(CGEventGetFlags(chord.events[n]) & NX_DEVICELSHIFTKEYMASK));
+            }
+            assert(CGEventGetFlags(chord.events[1]) & NX_DEVICERSHIFTKEYMASK);
+            assert(CGEventGetFlags(chord.events[3]) == 0);
+            clearEvents(&chord);
         }
         NSString *sample = @"1234567890123456789😀中文";
         assert(prepareText(&unicode, sample));

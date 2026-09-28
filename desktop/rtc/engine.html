@@ -35,11 +35,12 @@
 <button id="keyboard-permission" type="button">设置辅助功能权限</button><button id="keyboard-check" type="button">检查权限</button><p id="keyboard-status" role="status"></p>
 </section>
 <section aria-labelledby="dictation-title"><h2 id="dictation-title">语音快捷键</h2>
-<p>选择输入法已有的快捷键，按一次开始、再按一次结束。此处不会更改输入法设置，不支持双击、长按或 Fn／地球键。</p>
-<form id="dictation-form"><label for="dictation-key">单键或组合键的主键</label><select id="dictation-key"></select>
-<fieldset id="dictation-modifiers"><legend>组合键修饰键（单键无需勾选）</legend></fieldset>
+<p>录入输入法已有的快捷键，按一次开始、再按一次结束。此处不会更改输入法设置，不支持双击、长按或 Fn／地球键。</p>
+<form id="dictation-form"><p>当前快捷键：<strong id="dictation-key"></strong></p>
+<button id="dictation-record" type="button" aria-describedby="dictation-record-help">录入快捷键</button>
+<p id="dictation-record-help">先松开所有按键，点击录入后直接按键，再全部松开，自动保存。支持单键、组合键及 Command＋Option 等纯修饰键组合；再次点击取消。系统占用的快捷键可能无法录入或会触发系统操作。</p>
 <details><summary>结束后发送延迟</summary><label for="dictation-delay">等待最后文字上屏（毫秒，默认 350）</label><input id="dictation-delay" type="number" min="0" max="3000" step="50" value="350"></details>
-<button type="submit">保存语音设置</button><p id="dictation-status" role="status"></p></form>
+<button id="dictation-save" type="submit" hidden>重试保存</button><p id="dictation-status" role="status"></p></form>
 <p>测试：保存后将 Mac 光标放入输入框，用手机“讲话”开始、结束各一次；确认正常后再试“结束并发送”。手动操作输入法可能使听写状态不一致。</p></section>
 <section aria-labelledby="connection-title"><h2 id="connection-title">连接服务设置</h2>
 <p id="connection-config-error" role="alert"></p><p id="connection-backup"></p>

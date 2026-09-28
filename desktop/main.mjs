@@ -102,6 +102,7 @@ export async function startDesktop({ stateDir = app.getPath('userData'), show = 
   };
   const trusted = event => !window.isDestroyed() && event.sender === window.webContents &&
     event.senderFrame === window.webContents.mainFrame;
+  window.on('blur', () => { if (!window.isDestroyed()) window.webContents.setIgnoreMenuShortcuts(false); });
   const close = () => closing ??= Promise.resolve().then(async () => {
     clearInterval(stateTimer);
     keyboard.advertise?.(0);
@@ -160,6 +161,11 @@ export async function startDesktop({ stateDir = app.getPath('userData'), show = 
           await rename(temporary, keyboardPreferencePath);
           keyboardEnabled = next; bridge.setKeyboardEnabled(next);
         } finally { savingKeyboard = false; await rm(temporary, { force: true }); }
+      }
+      else if (action === 'dictation-recording') {
+        if (typeof keyId !== 'boolean') throw new Error('快捷键录入状态无效');
+        window.webContents.setIgnoreMenuShortcuts(keyId && window.isFocused());
+        return null;
       }
       else if (action === 'dictation-save') {
         if (savingDictation) throw new Error('正在保存语音快捷键');

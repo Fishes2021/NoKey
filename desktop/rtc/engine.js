@@ -1,4 +1,5 @@
-import { KEY_CODES, keyboardKeyLabel } from '../../mobile/lib/keyboard-shortcuts.mjs';
+import { keyboardKeyLabel } from '../../mobile/lib/keyboard-shortcuts.mjs';
+import { recordedShortcut } from '../shortcut-recorder.mjs';
 import { VoiceReceiver } from './receiver.js';
 const receiver = new VoiceReceiver({ onPCM: window.voiceEngine.pcm,
   onClear: window.voiceEngine.clear, onClosed: window.voiceEngine.closed });
@@ -40,31 +41,84 @@ const renderAudio = () => {
 let desktopState, connectionDirty = false;
 let dictationDirty = false;
 const dictationKey = document.getElementById('dictation-key');
-for (const key of Object.keys(KEY_CODES)) {
-  const option = document.createElement('option'); option.value = key; option.textContent = keyboardKeyLabel(key); dictationKey.append(option);
-}
-for (const name of ['command', 'control', 'option', 'shift']) {
-  const label = document.createElement('label'), input = document.createElement('input');
-  input.type = 'checkbox'; input.value = name; input.name = 'dictation-modifier';
-  label.append(input, name[0].toUpperCase() + name.slice(1)); document.getElementById('dictation-modifiers').append(label);
-}
-const updateModifiers = () => {
-  const single = /^(Left|Right)(Option|Control|Shift|Command)$/.test(dictationKey.value);
-  for (const box of document.querySelectorAll('[name="dictation-modifier"]')) { box.disabled = single; if (single) box.checked = false; }
+const recordButton = document.getElementById('dictation-record');
+const saveButton = document.getElementById('dictation-save');
+let shortcut, recording = false, candidate;
+const heldCodes = new Set();
+const showShortcut = () => { dictationKey.textContent = shortcut ? [...shortcut.modifiers, shortcut.key].map(keyboardKeyLabel).join(' + ') : ''; };
+const stopRecording = () => {
+  recording = false; candidate = undefined; heldCodes.clear();
+  recordButton.textContent = '录入快捷键'; saveButton.disabled = false;
+  void window.desktopClient.action('dictation-recording', false).catch(error => {
+    document.getElementById('dictation-status').textContent = error.message;
+  });
 };
-document.getElementById('dictation-form').addEventListener('input', () => { dictationDirty = true; updateModifiers(); });
-document.getElementById('dictation-form').addEventListener('submit', async event => {
-  event.preventDefault();
-  const button = event.currentTarget.querySelector('button'); button.disabled = true;
+recordButton.addEventListener('click', async () => {
+  if (recording) { stopRecording(); document.getElementById('dictation-status').textContent = '已取消录入，原设置保留。'; return; }
+  recordButton.disabled = true;
   try {
-    const state = await window.desktopClient.action('dictation-save', { key: dictationKey.value,
-      modifiers: [...document.querySelectorAll('[name="dictation-modifier"]:checked')].map(box => box.value),
-      sendDelayMs: Number(document.getElementById('dictation-delay').value) });
-    dictationDirty = false; renderDesktop(state);
-    document.getElementById('dictation-status').textContent = '已保存，下次讲话生效；当前讲话沿用开始时的设置。';
+    await window.desktopClient.action('dictation-recording', true);
+    if (!document.hasFocus()) { stopRecording(); return; }
+    recording = true; candidate = undefined; saveButton.disabled = true;
+    recordButton.textContent = '正在录入…点击取消';
+    document.getElementById('dictation-status').textContent = '请按下快捷键，再全部松开。';
   } catch (error) { document.getElementById('dictation-status').textContent = error.message; }
-  finally { button.disabled = false; }
+  finally { recordButton.disabled = false; recordButton.focus(); }
 });
+window.addEventListener('keydown', event => {
+  if (!recording) return;
+  event.preventDefault(); event.stopImmediatePropagation();
+  if (event.repeat) return;
+  try {
+    const next = recordedShortcut(event, heldCodes);
+    const family = /^(Meta|Alt|Control|Shift)(Left|Right)$/.exec(event.code)?.[1];
+    if (family && [...heldCodes].some(code => code !== event.code && code.startsWith(family)))
+      throw new Error('暂不支持同时使用同一种修饰键的左右两侧');
+    heldCodes.add(event.code);
+    // A chord has one non-modifier key. Keep its modifier snapshot until release.
+    if (!candidate || /^(Left|Right)(Option|Control|Shift|Command)$/.test(candidate.key)) candidate = next;
+    else if (next.key !== candidate.key) throw new Error('一次只能录入一个快捷键，请重新录入');
+    document.getElementById('dictation-status').textContent = [...candidate.modifiers, candidate.key].map(keyboardKeyLabel).join(' + ');
+  } catch (error) { stopRecording(); document.getElementById('dictation-status').textContent = error.message; }
+}, true);
+window.addEventListener('keyup', event => {
+  if (!recording) return;
+  event.preventDefault(); event.stopImmediatePropagation();
+  heldCodes.delete(event.code);
+  if (!candidate || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+  shortcut = candidate; dictationDirty = true; stopRecording(); showShortcut();
+  void saveDictation();
+}, true);
+document.addEventListener('pointerdown', event => {
+  if (recording && event.target !== recordButton) {
+    stopRecording(); document.getElementById('dictation-status').textContent = '已取消录入，原设置保留。';
+  }
+}, true);
+window.addEventListener('blur', () => {
+  if (recording) { stopRecording(); document.getElementById('dictation-status').textContent = '窗口失去焦点，已取消录入，原设置保留。'; }
+});
+document.getElementById('dictation-delay').addEventListener('input', () => { dictationDirty = true; });
+document.getElementById('dictation-delay').addEventListener('change', () => { void saveDictation(); });
+async function saveDictation() {
+  if (recording || !shortcut) return;
+  const button = saveButton; button.disabled = true;
+  recordButton.disabled = true;
+  document.getElementById('dictation-delay').disabled = true;
+  document.getElementById('dictation-status').textContent = '正在保存…';
+  try {
+    const state = await window.desktopClient.action('dictation-save', { ...shortcut,
+      sendDelayMs: Number(document.getElementById('dictation-delay').value) });
+    dictationDirty = false; saveButton.hidden = true; renderDesktop(state);
+    document.getElementById('dictation-status').textContent = '已保存，下次讲话生效；当前讲话沿用开始时的设置。';
+  } catch (error) {
+    saveButton.hidden = false;
+    document.getElementById('dictation-status').textContent = `未保存，新快捷键尚未生效：${error.message}`;
+  } finally {
+    button.disabled = false; recordButton.disabled = false;
+    document.getElementById('dictation-delay').disabled = false;
+  }
+}
+document.getElementById('dictation-form').addEventListener('submit', event => { event.preventDefault(); void saveDictation(); });
 
 const renderExpiry = () => {
   if (!desktopState) return;
@@ -91,11 +145,10 @@ const renderNetwork = () => {
 const renderDesktop = state => {
   if (!state) return;
   desktopState = state;
-  if (!dictationDirty && state.dictation) {
-    dictationKey.value = state.dictation.key;
+  if (!dictationDirty && !recording && state.dictation) {
+    shortcut = { key: state.dictation.key, modifiers: [...state.dictation.modifiers] };
+    showShortcut();
     document.getElementById('dictation-delay').value = state.dictation.sendDelayMs;
-    for (const box of document.querySelectorAll('[name="dictation-modifier"]')) box.checked = state.dictation.modifiers.includes(box.value);
-    updateModifiers();
   }
   if (state.dictationError) document.getElementById('dictation-status').textContent = state.dictationError;
   document.getElementById('summary-phone').textContent = state.devices?.length ? `● 已配对 ${state.devices.length} 台手机` : '○ 尚未配对手机';

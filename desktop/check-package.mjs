@@ -24,7 +24,7 @@ const payload = path.join(expanded, 'payload.pkg/Payload');
 const bundle = path.join(payload, 'Applications/NoKey.app');
 const appRoot = path.join(bundle, 'Contents/Resources/app');
 const driver = path.join(payload, 'Library/Audio/Plug-Ins/HAL/VoiceDeckMicrophone.driver');
-for (const relative of ['desktop/assets/trayTemplate.png', 'desktop/assets/trayTemplate@2x.png', 'desktop/main.mjs', 'desktop/microphone-selection.mjs', 'desktop/voice-host.mjs', 'desktop/login-item.mjs', 'desktop/rtc/engine.js', 'desktop/rtc/receiver.js', 'bridge/server.mjs', 'bridge/lib/remote-relay.mjs', 'bridge/lib/remote-message-queue.mjs', 'bridge/lib/control-session.mjs', 'bridge/lib/pairing-confirmation.mjs']) {
+for (const relative of ['desktop/assets/trayTemplate.png', 'desktop/assets/trayTemplate@2x.png', 'desktop/main.mjs', 'desktop/shortcut-recorder.mjs', 'desktop/microphone-selection.mjs', 'desktop/voice-host.mjs', 'desktop/login-item.mjs', 'desktop/rtc/engine.js', 'desktop/rtc/receiver.js', 'bridge/server.mjs', 'bridge/lib/remote-relay.mjs', 'bridge/lib/remote-message-queue.mjs', 'bridge/lib/control-session.mjs', 'bridge/lib/pairing-confirmation.mjs']) {
   assert.deepEqual(await readFile(path.join(appRoot, relative)), await readFile(path.join(root, relative)), `stale packaged source: ${relative}`);
 }
 
